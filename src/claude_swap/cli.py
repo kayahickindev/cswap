@@ -654,6 +654,15 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--model-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "In tiered mode, rotate between accounts with model quota at "
+            "this utilization (50-99.9; default 90)"
+        ),
+    )
+    parser.add_argument(
         "--include-api-key-accounts",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -664,12 +673,13 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "tiered"),
         default=None,
         help=(
             "Target selection: 'best' (most quota left; default) or "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'tiered' (rotate fresh model quota first, "
+            "then drain model and general quota near 100%% by earliest reset)"
         ),
     )
     parser.add_argument(

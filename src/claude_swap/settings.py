@@ -47,7 +47,7 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    strategy: str = "best"  # "best", "consume-first", or model-aware "tiered"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -57,6 +57,10 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # In tiered mode, rotate to another account with usable model quota at
+    # this utilization. ``threshold`` remains the near-100 drain ceiling once
+    # no fresh model account remains.
+    model_threshold: float = 90.0
 
 
 @dataclass(frozen=True)
@@ -120,7 +124,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "tiered"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -134,6 +138,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "modelThreshold", "model_threshold", "float", 50.0, 99.9,
+            help="Tiered-mode model rotation threshold in pct",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -430,6 +438,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
+        ("model_threshold", "model_threshold"),
         ("strategy", "strategy"),
     ):
         value = getattr(args, attr, None)

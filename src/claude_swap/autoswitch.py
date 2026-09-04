@@ -630,6 +630,92 @@ def _headroom_by_account(
     }
 
 
+def _scoped_model_windows(
+    usage: dict | str | None, models: Sequence[str]
+) -> list[tuple[str, float, str | None]]:
+    """Configured per-model windows only, excluding the account-wide axes."""
+    if not isinstance(usage, dict) or not models:
+        return []
+    wanted = {model.lower() for model in models}
+    match_all = "all" in wanted
+    scoped = usage.get("scoped")
+    if not isinstance(scoped, list):
+        return []
+    return [
+        (row["name"], float(row["pct"]), row.get("resets_at"))
+        for row in scoped
+        if isinstance(row, dict)
+        and isinstance(row.get("name"), str)
+        and isinstance(row.get("pct"), (int, float))
+        and (match_all or row["name"].lower() in wanted)
+    ]
+
+
+def _scoped_model_pct(
+    usage: dict | str | None, models: Sequence[str]
+) -> float | None:
+    windows = _scoped_model_windows(usage, models)
+    return max((pct for _, pct, _ in windows), default=None)
+
+
+def _model_reset_ts(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float | None:
+    """Reset for the binding configured model window, if it is in the future."""
+    windows = _scoped_model_windows(usage, models)
+    if not windows:
+        return None
+    _, _, resets_at = max(windows, key=lambda window: window[1])
+    ts = _parse_reset_ts(resets_at)
+    return ts if ts is not None and ts > now else None
+
+
+def _consume_reset_ts(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float | None:
+    """Perishable reset for the active policy tier."""
+    if models:
+        return _model_reset_ts(usage, models, now)
+    return _seven_day_reset_ts(usage, now)
+
+
+def _fresh_model_headroom(
+    usage: dict | str | None,
+    models: Sequence[str],
+    model_threshold: float,
+    general_threshold: float,
+) -> float | None:
+    """Headroom for fresh-model rotation with a separate general ceiling.
+
+    Model quota rotates at ``model_threshold``. Account-wide 5h/7d quota is
+    scaled so it reaches that same decision line at ``general_threshold``.
+    This lets a freshly reset model run on an account whose weekly total is
+    already above 90%, while still refusing an account at a hard 100% limit.
+    """
+    model_pct = _scoped_model_pct(usage, models)
+    general_headroom = oauth.account_headroom(
+        usage if isinstance(usage, dict) else None, ()
+    )
+    if model_pct is None or general_headroom is None:
+        return None
+    if general_headroom <= 0:
+        return 0.0
+    general_pct = 100.0 - general_headroom
+    scaled_general_pct = general_pct * model_threshold / general_threshold
+    return 100.0 - max(model_pct, scaled_general_pct)
+
+
+def _model_headroom(
+    usage: dict | str | None, models: Sequence[str]
+) -> float | None:
+    """Model-aware headroom only when the configured model row is present."""
+    if _scoped_model_pct(usage, models) is None:
+        return None
+    return oauth.account_headroom(
+        usage if isinstance(usage, dict) else None, models
+    )
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -656,10 +742,19 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # The tiered strategy changes which axes bind each tick. Keep the
+        # configured models immutable for collection and typo checks, and the
+        # decision models separate for ranking and recovery math.
+        self._decision_models = self._models
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        poll_threshold = (
+            min(settings.threshold, settings.model_threshold)
+            if settings.strategy == "tiered" and self._models
+            else settings.threshold
+        )
+        switcher.set_poll_policy_inputs(poll_threshold, self._models)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -684,6 +779,188 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # One active-account sample is enough to estimate short-term burn on
+        # the next tick. It is deliberately process-local: a restart begins
+        # conservatively at a one-point margin instead of trusting stale rate.
+        self._burn_samples: dict[
+            tuple[str, tuple[str, ...]],
+            tuple[dict[str, tuple[str | None, float]], float],
+        ] = {}
+        self._adaptive_margins_pct: dict[
+            tuple[str, tuple[str, ...]], int
+        ] = {}
+        self._tier_mode: str | None = None
+
+    def _adaptive_drain_threshold(
+        self,
+        current: str,
+        entry,
+        usage: dict | str | None,
+        models: tuple[str, ...],
+        ceiling: float,
+    ) -> float:
+        """Near-100 threshold with enough room for one poll plus pickup tail."""
+        windows = oauth.relevant_windows(
+            usage if isinstance(usage, dict) else None, models
+        )
+        fetched_at = getattr(entry, "fetched_at", None)
+        model_key = tuple(model.lower() for model in models)
+        sample_key = (current, model_key)
+        if not windows or not isinstance(fetched_at, (int, float)):
+            self._burn_samples.pop(sample_key, None)
+            self._adaptive_margins_pct[sample_key] = 1
+            return min(ceiling, 99.0)
+
+        window_values = {
+            label: (resets_at, pct) for label, pct, resets_at in windows
+        }
+        prior = self._burn_samples.get(sample_key)
+        margin = self._adaptive_margins_pct.get(sample_key, 1)
+        if prior is None:
+            margin = 1
+        else:
+            prior_windows, prior_at = prior
+            elapsed = fetched_at - prior_at
+            burns = []
+            for label, (resets_at, pct) in window_values.items():
+                prior_window = prior_windows.get(label)
+                if prior_window is None or prior_window[0] != resets_at:
+                    continue
+                prior_pct = prior_window[1]
+                if pct >= prior_pct:
+                    burns.append(pct - prior_pct)
+            if elapsed > 0 and burns:
+                # Cover the next polling interval and Claude Code's observed
+                # macOS Keychain pickup tail. Cap at ten points so a single
+                # burst cannot turn the drain phase back into ordinary 90%.
+                horizon = self.settings.interval_seconds + 30.0
+                projected = max(burns) / elapsed * horizon
+                margin = max(1, min(10, math.ceil(projected)))
+            elif elapsed > 0:
+                # Every comparable window reset or was corrected downward.
+                margin = 1
+        if prior is None or fetched_at >= prior[1]:
+            self._burn_samples[sample_key] = (window_values, float(fetched_at))
+        self._adaptive_margins_pct[sample_key] = margin
+        return min(ceiling, 100.0 - margin)
+
+    def _tiered_policy(
+        self,
+        current: str,
+        quarantined: set[str],
+        entries: dict,
+        usage: dict[str, dict | str | None],
+        settings: AutoSwitchSettings,
+    ) -> tuple[AutoSwitchSettings, dict[str, float | None]]:
+        """Resolve fresh-model, residual-model, or general-drain mode."""
+        relevant = [
+            number
+            for number in self.switcher.switchable_account_numbers()
+            if number not in quarantined
+            and self.switcher.account_kind_for(number) != "api_key"
+        ]
+        model_states = [
+            (
+                _scoped_model_pct(usage.get(number), self._models),
+                oauth.account_headroom(
+                    usage.get(number)
+                    if isinstance(usage.get(number), dict)
+                    else None,
+                    (),
+                ),
+            )
+            for number in relevant
+        ]
+        has_fresh = any(
+            pct is not None
+            and general_headroom is not None
+            and general_headroom > 0
+            and pct < settings.model_threshold
+            for pct, general_headroom in model_states
+        )
+        model_unknown = any(
+            pct is None or general_headroom is None
+            for pct, general_headroom in model_states
+        )
+        if has_fresh:
+            # Normal model rotation. Account-wide quota retains its separate
+            # near-100 ceiling instead of becoming a second 90% model gate.
+            self._tier_mode = "fresh-model"
+            self._decision_models = self._models
+            headroom = {
+                number: _fresh_model_headroom(
+                    value,
+                    self._models,
+                    settings.model_threshold,
+                    settings.threshold,
+                )
+                for number, value in usage.items()
+            }
+            return (
+                replace(
+                    settings,
+                    # Hold the current model allocation until it reaches the
+                    # model threshold, then rank fresh targets by reset time.
+                    strategy="tiered",
+                    threshold=settings.model_threshold,
+                ),
+                headroom,
+            )
+
+        # A missing model row is not proof that the fleet exhausted it. Stay
+        # in model mode until every eligible OAuth account says 100%.
+        has_any_residual = any(
+            pct is not None
+            and general_headroom is not None
+            and general_headroom > 0
+            and pct < 100.0
+            for pct, general_headroom in model_states
+        )
+        if model_unknown or has_any_residual:
+            model_drain_threshold = self._adaptive_drain_threshold(
+                current,
+                entries.get(current),
+                usage.get(current),
+                self._models,
+                settings.threshold,
+            )
+            has_safe_residual = any(
+                pct is not None
+                and general_headroom is not None
+                and general_headroom > 0
+                and pct < model_drain_threshold
+                for pct, general_headroom in model_states
+            )
+            if model_unknown or has_safe_residual:
+                self._tier_mode = "model-drain"
+                self._decision_models = self._models
+                return (
+                    replace(
+                        settings,
+                        strategy="consume-first",
+                        threshold=model_drain_threshold,
+                    ),
+                    {
+                        number: _model_headroom(value, self._decision_models)
+                        for number, value in usage.items()
+                    },
+                )
+
+        # Every readable configured model row is exhausted. Ignore model quota
+        # until any row resets, and spend the most perishable general quota.
+        self._tier_mode = "general-drain"
+        self._decision_models = ()
+        threshold = self._adaptive_drain_threshold(
+            current,
+            entries.get(current),
+            usage.get(current),
+            self._decision_models,
+            settings.threshold,
+        )
+        return (
+            replace(settings, strategy="consume-first", threshold=threshold),
+            _headroom_by_account(usage, self._decision_models),
+        )
 
     # -- state file ---------------------------------------------------------
 
@@ -934,9 +1211,20 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+        collection_threshold = (
+            min(settings.threshold, settings.model_threshold)
+            if settings.strategy == "tiered" and self._models
+            else settings.threshold
         )
+        entries, usage, headroom = self._collect_scheduled_usage(
+            current, quarantined, threshold=collection_threshold
+        )
+        if settings.strategy == "tiered" and self._models:
+            settings, headroom = self._tiered_policy(
+                current, quarantined, entries, usage, settings
+            )
+        else:
+            self._decision_models = self._models
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1046,7 +1334,17 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        urgent_model_rotation = (
+            self.settings.strategy == "tiered"
+            and self._tier_mode == "fresh-model"
+            and (_scoped_model_pct(usage.get(current), self._models) or 0.0)
+            >= self.settings.model_threshold
+        )
+        if (
+            trigger in ("proactive", "consume-first")
+            and self._in_cooldown(state)
+            and not urgent_model_rotation
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1098,7 +1396,7 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        consume_first = settings.strategy == "consume-first"
+        consume_first = settings.strategy in ("consume-first", "tiered")
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1202,7 +1500,13 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
-            headroom = _headroom_by_account(usage, self._models)
+            if self.settings.strategy == "tiered" and self._models:
+                settings, headroom = self._tiered_policy(
+                    current, quarantined, entries, usage, self.settings
+                )
+            else:
+                self._decision_models = self._models
+                headroom = _headroom_by_account(usage, self._decision_models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
@@ -1307,7 +1611,9 @@ class AutoSwitchEngine:
         # consume-first that is the phase-2 refetch, not the stale one.
         left_snapshot = (
             active_headroom,
-            _binding_recovery_ts(usage.get(current), self._models, decided_now),
+            _binding_recovery_ts(
+                usage.get(current), self._decision_models, decided_now
+            ),
         )
         transient_failure = False
         systemic = ""
@@ -1335,7 +1641,13 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(
+                    num,
+                    email,
+                    trigger,
+                    left_snapshot,
+                    bypass_cooldown=urgent_model_rotation,
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1366,7 +1678,13 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(
+                num,
+                email,
+                trigger,
+                left_snapshot,
+                bypass_cooldown=urgent_model_rotation,
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -1618,6 +1936,9 @@ class AutoSwitchEngine:
             # silent hold.
             return True
         barred = str(came_from)
+        # A few pure-policy callers construct a minimal engine without
+        # running __init__. Preserve that supported test seam.
+        decision_models = getattr(self, "_decision_models", self._models)
         if "leftHeadroom" not in state:
             return True          # pre-upgrade record: genuinely no evidence
         h = headroom.get(barred)
@@ -1671,8 +1992,12 @@ class AutoSwitchEngine:
             # dominance leg has, guarded directly in the mutation table.
             if h is not None and h > 100.0 - settings.threshold:
                 return True
-            peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
-            active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
+            peer_recovery_ts = _binding_recovery_ts(
+                usage.get(barred), decision_models, now
+            )
+            active_recovery_ts = _binding_recovery_ts(
+                usage.get(current), decision_models, now
+            )
             # The active's recovery must be a REAL measurement, not merely
             # "larger" -- `_binding_recovery_ts` returns `inf` for both
             # "never resets" and "we do not know" (no windows, no
@@ -1748,7 +2073,7 @@ class AutoSwitchEngine:
         # schedule around. Moving off it onto a real reset IS the improvement.
         was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
         return (
-            _binding_recovery_ts(usage.get(barred), self._models, now)
+            _binding_recovery_ts(usage.get(barred), decision_models, now)
             < was - RECOVERY_HYSTERESIS_S
         )
 
@@ -1773,10 +2098,13 @@ class AutoSwitchEngine:
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
         """
-        # consume-first ranks by soonest weekly reset; a proactive (below-
-        # threshold) target must reset strictly sooner than where we are.
+        # consume-first ranks by the active tier's perishable reset: scoped
+        # model reset in model mode, weekly account reset in general mode.
+        # A proactive below-threshold target must reset strictly sooner.
         active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
+            _consume_reset_ts(usage.get(current), self._decision_models, now)
+            if consume_first
+            else None
         )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
@@ -1818,7 +2146,9 @@ class AutoSwitchEngine:
             default=0.0,
         )
         active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now)
+            _binding_recovery_ts(
+                usage.get(current), self._decision_models, now
+            )
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
@@ -1836,10 +2166,12 @@ class AutoSwitchEngine:
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _consume_reset_ts(usage.get(num), self._decision_models, now)
+                if consume_first
+                else None
             )
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(usage.get(num), self._decision_models, now)
                 if all_above
                 else 0.0
             )
@@ -2102,6 +2434,8 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        *,
+        bypass_cooldown: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2124,7 +2458,11 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if (
+                trigger in ("proactive", "consume-first")
+                and self._in_cooldown(state)
+                and not bypass_cooldown
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2245,12 +2583,14 @@ class AutoSwitchEngine:
                 continue
             blocked = [
                 resets_at
-                for _, pct, resets_at in oauth.relevant_windows(value, self._models)
+                for _, pct, resets_at in oauth.relevant_windows(
+                    value, self._decision_models
+                )
                 if pct >= 100.0
             ]
             if not blocked:
                 continue  # not exhausted — doesn't gate the blocked state
-            usable_at = _limiting_reset_ts(value, self._models)
+            usable_at = _limiting_reset_ts(value, self._decision_models)
             if usable_at is None or usable_at <= now:
                 return None  # blocked with unprovable recovery — don't oversleep
             if earliest is None or usable_at < earliest:
@@ -2281,7 +2621,12 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        poll_threshold = (
+            min(threshold, self.settings.model_threshold)
+            if self.settings.strategy == "tiered" and self._models
+            else threshold
+        )
+        self.switcher.set_poll_policy_inputs(poll_threshold, self._models)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

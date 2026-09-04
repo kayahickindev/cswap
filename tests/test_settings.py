@@ -30,6 +30,7 @@ from claude_swap.settings import (
 def _args(**kwargs) -> argparse.Namespace:
     defaults = {
         "threshold": None,
+        "model_threshold": None,
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
@@ -97,6 +98,13 @@ class TestLoadSettings:
     def test_set_strategy_consume_first(self, tmp_path: Path):
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
+
+    def test_tiered_strategy_and_model_threshold_round_trip(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "tiered")
+        set_setting(tmp_path, "autoswitch.modelThreshold", "90")
+        loaded = load_settings(tmp_path)
+        assert loaded.strategy == "tiered"
+        assert loaded.model_threshold == 90.0
 
 
 class TestSaveSettings:
@@ -280,6 +288,10 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+    def test_model_threshold_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(model_threshold=87.5))
+        assert merged.model_threshold == 87.5
 
 
 class TestAtomicWriteThroughSymlink:

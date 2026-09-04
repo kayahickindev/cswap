@@ -253,6 +253,21 @@ class TestResetCapping:
         assert interval == poll_policy.EXHAUSTED_INTERVAL_S
         assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S)
 
+    def test_exhausted_model_poll_is_pulled_to_its_reset(self):
+        reset_ts = NOW + 90.0
+        usage = _usage(20)
+        usage["scoped"] = [{
+            "name": "Fable",
+            "pct": 100.0,
+            "resets_at": self._iso(reset_ts),
+        }]
+        next_poll, interval = _plan(
+            new_usage=usage,
+            models=("Fable",),
+        )
+        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
+        assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S)
+
     @pytest.mark.parametrize("reset_ts", [NOW - 90.0, NOW])
     def test_at_limit_ignores_non_future_reset(self, reset_ts):
         next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))

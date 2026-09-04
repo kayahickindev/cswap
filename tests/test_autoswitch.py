@@ -2782,6 +2782,194 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+def _tier_usage(
+    pct5: float,
+    pct7: float,
+    fable: float,
+    reset7: str,
+    reset_fable: str,
+) -> dict:
+    return {
+        "five_hour": {"pct": pct5},
+        "seven_day": {"pct": pct7, "resets_at": reset7},
+        "scoped": [
+            {"name": "Fable", "pct": fable, "resets_at": reset_fable},
+        ],
+    }
+
+
+class TestTieredModelStrategy:
+    """Prefer Fable while usable, then consume expiring general quota."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(
+            temp_home,
+            strategy="tiered",
+            threshold=99.0,
+            model_threshold=90.0,
+            model="Fable",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_at_model_threshold_rotates_to_fresh_model_resetting_soonest(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(10, 20, 90, _R_LATEST, _R_LATER),
+            "2": _tier_usage(10, 20, 20, _R_LATEST, _R_SOON),
+            "3": _tier_usage(10, 20, 10, _R_LATEST, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_fresh_model_mode_holds_until_the_model_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(10, 20, 89, _R_LATEST, _R_LATEST),
+            "2": _tier_usage(10, 20, 20, _R_LATEST, _R_SOON),
+            "3": _tier_usage(10, 20, 10, _R_LATEST, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_last_model_account_drains_past_model_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(10, 20, 90, _R_SOON, _R_SOON),
+            "2": _tier_usage(10, 20, 100, _R_LATER, _R_LATER),
+            "3": _tier_usage(10, 20, 100, _R_LATEST, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_when_model_is_gone_general_quota_resets_soonest_first(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(7, 61, 100, _R_LATEST, _R_LATEST),
+            "2": _tier_usage(15, 90, 100, _R_SOON, _R_SOON),
+            "3": _tier_usage(0, 90, 100, _R_LATER, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_model_reset_interrupts_general_drain_immediately(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(7, 61, 100, _R_LATEST, _R_LATEST),
+            "2": _tier_usage(15, 90, 0, _R_LATER, _R_SOON),
+            "3": _tier_usage(0, 90, 100, _R_SOON, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_model_reset_bypasses_a_recent_general_drain_cooldown(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(lambda state: state.update(lastSwitchAt=h.clock()))
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(7, 61, 95, _R_LATEST, _R_LATEST),
+            "2": _tier_usage(15, 90, 0, _R_LATER, _R_SOON),
+            "3": _tier_usage(0, 90, 100, _R_SOON, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_unknown_model_row_never_masquerades_as_fresh_quota(self, temp_home):
+        h = self._harness(temp_home)
+        missing_model = _usage7(10, 20, _R_SOON)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(10, 20, 100, _R_LATER, _R_LATER),
+            "2": missing_model,
+            "3": _tier_usage(10, 20, 100, _R_LATEST, _R_LATEST),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_model_quota_behind_a_hard_general_limit_is_not_usable(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(10, 20, 90, _R_SOON, _R_SOON),
+            "2": _tier_usage(100, 20, 10, _R_LATER, _R_LATER),
+            "3": _tier_usage(10, 20, 100, _R_LATEST, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_fast_general_burn_expands_the_adaptive_margin(self, temp_home):
+        h = self._harness(temp_home)
+        first = {
+            "1": _tier_usage(10, 90, 100, _R_SOON, _R_SOON),
+            "2": _tier_usage(10, 20, 100, _R_LATER, _R_LATER),
+            "3": _tier_usage(10, 10, 100, _R_LATEST, _R_LATEST),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.NO_ACTION
+
+        h.clock.advance(60)
+        h.events.clear()
+        second = dict(first)
+        second["1"] = _tier_usage(10, 97, 100, _R_SOON, _R_SOON)
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        polls = [e for e in h.events if isinstance(e, PollEvent)]
+        assert polls[-1].threshold < 99.0
+        assert h.active_number() == 2
+
+    def test_fast_final_model_burn_hands_off_before_the_hard_limit(self, temp_home):
+        h = self._harness(temp_home)
+        first = {
+            "1": _tier_usage(10, 61, 90, _R_LATEST, _R_SOON),
+            "2": _tier_usage(10, 20, 100, _R_SOON, _R_LATER),
+            "3": _tier_usage(10, 20, 100, _R_LATER, _R_LATEST),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.NO_ACTION
+
+        h.clock.advance(60)
+        second = dict(first)
+        second["1"] = _tier_usage(10, 61, 97, _R_LATEST, _R_SOON)
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_adaptive_margin_tracks_fast_nonbinding_window_burn(self, temp_home):
+        h = self._harness(temp_home)
+        first = {
+            "1": _tier_usage(98, 90, 100, _R_SOON, _R_SOON),
+            "2": _tier_usage(10, 20, 100, _R_LATER, _R_LATER),
+            "3": _tier_usage(10, 10, 100, _R_LATEST, _R_LATEST),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.NO_ACTION
+
+        h.clock.advance(60)
+        h.events.clear()
+        second = dict(first)
+        second["1"] = _tier_usage(98, 97, 100, _R_SOON, _R_SOON)
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.threshold < 99.0
+        assert h.active_number() == 2
+
+    def test_slow_general_burn_keeps_the_one_point_margin(self, temp_home):
+        h = self._harness(temp_home)
+        first = {
+            "1": _tier_usage(10, 90, 100, _R_SOON, _R_SOON),
+            "2": _tier_usage(10, 20, 100, _R_LATER, _R_LATER),
+            "3": _tier_usage(10, 10, 100, _R_LATEST, _R_LATEST),
+        }
+        assert h.tick_with_usage(first) is TickOutcome.NO_ACTION
+
+        h.clock.advance(60)
+        h.events.clear()
+        second = dict(first)
+        second["1"] = _tier_usage(10, 90.2, 100, _R_SOON, _R_SOON)
+        assert h.tick_with_usage(second) is TickOutcome.NO_ACTION
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.threshold == 99.0
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
@@ -6893,4 +7081,3 @@ class TestFreshenRoutesThroughGate:
         assert verdict == "ok"
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
-
