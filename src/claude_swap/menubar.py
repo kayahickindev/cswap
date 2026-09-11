@@ -820,14 +820,16 @@ def run(switcher) -> int:
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
+                if self._guard(lambda: self.switcher.manual_switch_to(str(num))):
                     self._notify_switched()
                     self.refresh_async()
             return cb
 
         def _switch(self, strategy):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
+                if self._guard(
+                    lambda: self.switcher.manual_switch(strategy=strategy)
+                ):
                     self._notify_switched()
                     self.refresh_async()
             return cb

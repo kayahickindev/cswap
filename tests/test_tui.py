@@ -155,9 +155,19 @@ class FakeSwitcher:
             "reason": "requested",
         }
 
+    def manual_switch_to(
+        self, identifier: str, json_output: bool = False, force: bool = False
+    ) -> dict:
+        return self.switch_to(identifier, json_output=json_output, force=force)
+
     def switch(self, strategy: str | None = None, json_output: bool = False) -> dict:
         self.calls.append(("switch", strategy))
         return {"switched": False, "from": None, "to": None, "reason": "no-better-target"}
+
+    def manual_switch(
+        self, strategy: str | None = None, json_output: bool = False
+    ) -> dict:
+        return self.switch(strategy=strategy, json_output=json_output)
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         self.calls.append(("remove", str(identifier), assume_yes))
@@ -1709,4 +1719,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-

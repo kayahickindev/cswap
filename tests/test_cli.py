@@ -198,7 +198,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
-        switcher_cls.return_value.switch.assert_called_once_with(
+        switcher_cls.return_value.manual_switch.assert_called_once_with(
             strategy="best", json_output=False, models=(), model_source=None
         )
 
@@ -215,7 +215,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
-        switcher_cls.return_value.switch.assert_called_once_with(
+        switcher_cls.return_value.manual_switch.assert_called_once_with(
             strategy="best", json_output=False,
             models=("Fable",), model_source="autoswitch.model",
         )
@@ -235,7 +235,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
-        switcher_cls.return_value.switch.assert_called_once_with(
+        switcher_cls.return_value.manual_switch.assert_called_once_with(
             strategy="next-available", json_output=False,
             models=("Opus", "Fable"), model_source="cli",
         )
@@ -256,7 +256,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
-        switcher_cls.return_value.switch.assert_called_once_with(
+        switcher_cls.return_value.manual_switch.assert_called_once_with(
             strategy=None, json_output=False, models=(), model_source=None
         )
 
@@ -308,7 +308,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
-        switcher_cls.return_value.switch_to.assert_called_once_with(
+        switcher_cls.return_value.manual_switch_to.assert_called_once_with(
             "2", json_output=False, force=True
         )
 
@@ -320,7 +320,7 @@ class TestCLI:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 
-        switcher_cls.return_value.switch_to.assert_called_once_with(
+        switcher_cls.return_value.manual_switch_to.assert_called_once_with(
             "2", json_output=False, force=False
         )
 
@@ -870,7 +870,7 @@ class TestSubcommandAliases:
              patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
-        switcher_cls.return_value.switch_to.assert_called_once_with(
+        switcher_cls.return_value.manual_switch_to.assert_called_once_with(
             "2", json_output=False, force=False
         )
 
@@ -881,7 +881,7 @@ class TestSubcommandAliases:
              patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
-        switcher_cls.return_value.switch.assert_called_once_with(
+        switcher_cls.return_value.manual_switch.assert_called_once_with(
             strategy=None, json_output=False, models=(), model_source=None
         )
 
@@ -976,10 +976,10 @@ class TestJsonOutputCli:
              patch.object(sys, "argv", ["claude-swap", "--switch", "--json"]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
-            switcher_cls.return_value.switch.return_value = payload
+            switcher_cls.return_value.manual_switch.return_value = payload
             cli.main()
 
-        switcher_cls.return_value.switch.assert_called_once_with(
+        switcher_cls.return_value.manual_switch.assert_called_once_with(
             strategy=None, json_output=True, models=(), model_source=None,
         )
         assert json.loads(capsys.readouterr().out) == payload
@@ -995,7 +995,7 @@ class TestJsonOutputCli:
              ]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
-            switcher_cls.return_value.switch.return_value = payload
+            switcher_cls.return_value.manual_switch.return_value = payload
             cli.main()
 
         out = json.loads(capsys.readouterr().out)

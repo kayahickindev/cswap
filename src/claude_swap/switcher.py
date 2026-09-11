@@ -5759,6 +5759,26 @@ class ClaudeAccountSwitcher:
             "warnings": warnings or [],
         }
 
+    def manual_switch(
+        self,
+        strategy: str | None = None,
+        json_output: bool = False,
+        models: tuple[str, ...] = (),
+        model_source: str | None = None,
+    ) -> dict | None:
+        """Run an explicit user rotation and temporarily override autoswitch."""
+        from claude_swap.autoswitch import run_manual_switch
+
+        return run_manual_switch(
+            self,
+            lambda: self.switch(
+                strategy=strategy,
+                json_output=json_output,
+                models=models,
+                model_source=model_source,
+            ),
+        )
+
     def switch(
         self,
         strategy: str | None = None,
@@ -6148,6 +6168,21 @@ class ClaudeAccountSwitcher:
         return (
             self._switch_result_from_op(op, strategy_label, warnings)
             if json_output else None
+        )
+
+    def manual_switch_to(
+        self, identifier: str, json_output: bool = False, force: bool = False
+    ) -> dict | None:
+        """Select one account and temporarily override autoswitch."""
+        from claude_swap.autoswitch import run_manual_switch
+
+        return run_manual_switch(
+            self,
+            lambda: self.switch_to(
+                identifier,
+                json_output=json_output,
+                force=force,
+            ),
         )
 
     def switch_to(

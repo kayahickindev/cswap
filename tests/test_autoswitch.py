@@ -2827,6 +2827,150 @@ class TestTieredModelStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_manual_override_drains_selected_account_before_normal_rotation(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(0, 78, 90, _R_SOON, _R_SOON),
+            "2": _tier_usage(0, 84, 93, _R_LATER, _R_LATER),
+            "3": _tier_usage(20, 62, 51, _R_LATEST, _R_LATEST),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["manual-override"]
+
+    def test_manual_switch_records_override_even_when_target_is_already_active(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+
+        result = h.switcher.manual_switch_to("1", json_output=True)
+
+        assert result is not None
+        assert result["reason"] == "already-active"
+        marker = h.state()["manualOverride"]
+        assert marker["account"] == "1"
+        assert isinstance(marker["selectedAt"], (int, float))
+
+    def test_manual_switch_records_the_account_it_activated(self, temp_home):
+        h = self._harness(temp_home)
+
+        result = h.switcher.manual_switch_to("2", json_output=True)
+
+        assert result is not None
+        assert result["switched"] is True
+        assert h.active_number() == 2
+        assert h.state()["manualOverride"]["account"] == "2"
+
+    def test_manual_override_releases_at_adaptive_drain_boundary(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(0, 78, 99, _R_SOON, _R_SOON),
+            "2": _tier_usage(0, 84, 93, _R_LATER, _R_LATER),
+            "3": _tier_usage(20, 62, 51, _R_LATEST, _R_LATEST),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert "manualOverride" not in h.state()
+
+    def test_manual_override_releases_after_selected_quota_cycle_resets(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+        usage = {
+            "1": _tier_usage(0, 78, 90, _R_SOON, _R_SOON),
+            "2": _tier_usage(0, 84, 93, _R_LATER, _R_LATER),
+            "3": _tier_usage(20, 62, 51, _R_LATEST, _R_LATEST),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert isinstance(h.state()["manualOverride"].get("until"), (int, float))
+
+        h.clock.now = (
+            poll_policy.parse_reset_ts(_R_SOON) + poll_policy.RESET_SLACK_S
+        )
+        h.events.clear()
+        usage["1"] = _tier_usage(0, 0, 0, _R_LATER, _R_LATER)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+
+        assert "manualOverride" not in h.state()
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_new_manual_override_wins_if_it_lands_before_auto_commit(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+
+        outcome = h.engine._perform(
+            "3", "c@example.com", "proactive", (10.0, h.clock() + 3600)
+        )
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["manual-override"]
+
+    def test_manual_override_does_not_block_unhealthy_failover(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+        usage = {
+            "1": None,
+            "2": _tier_usage(0, 84, 93, _R_LATER, _R_LATER),
+            "3": _tier_usage(20, 62, 51, _R_LATEST, _R_LATEST),
+        }
+
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        assert h.active_number() == 2
+        assert "manualOverride" not in h.state()
+
     def test_fresh_model_mode_holds_until_the_model_threshold(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({

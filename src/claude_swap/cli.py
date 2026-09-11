@@ -1411,7 +1411,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             else:
                 models = parse_model_names(load_settings(switcher.backup_dir).model)
                 model_source = "autoswitch.model" if models else None
-            payload = switcher.switch(
+            payload = switcher.manual_switch(
                 strategy=args.strategy,
                 json_output=args.json,
                 models=models,
@@ -1421,7 +1421,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
-            payload = switcher.switch_to(
+            payload = switcher.manual_switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
         elif args.status:

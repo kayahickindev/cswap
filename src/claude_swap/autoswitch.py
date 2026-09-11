@@ -57,8 +57,46 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+MANUAL_OVERRIDE_MAX_S = 8 * 24 * 3600.0
 
 _logger = logging.getLogger("claude-swap")
+
+
+def _read_state_file(path: Path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def run_manual_switch(
+    switcher: ClaudeAccountSwitcher,
+    operation: Callable[[], dict | None],
+    *,
+    clock: Callable[[], float] = time.time,
+) -> dict | None:
+    """Run a user-requested switch and hand its choice to the scheduler.
+
+    The scheduler and manual switch share one state lock. Holding it across
+    both the credential mutation and the marker write closes the otherwise
+    reachable gap where a daemon tick could immediately undo the user's
+    choice before learning that it was intentional.
+    """
+    state_path = switcher.backup_dir / STATE_FILENAME
+    lock = FileLock(state_path.parent / ".autoswitch_state.lock")
+    with lock:
+        result = operation()
+        current = switcher.current_account_number()
+        if current is not None:
+            state = _read_state_file(state_path)
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
+            state["manualOverride"] = {
+                "account": str(current),
+                "selectedAt": clock(),
+            }
+            atomic_write_json(state_path, state)
+        return result
 
 # Systemic freshen refusals, MOST ACTIONABLE FIRST. Deterministic conditions
 # that every candidate hits identically, so the tick reports one of them —
@@ -968,11 +1006,7 @@ class AutoSwitchEngine:
         return FileLock(self.state_path.parent / ".autoswitch_state.lock")
 
     def _read_state(self) -> dict:
-        try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
+        return _read_state_file(self.state_path)
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -987,6 +1021,84 @@ class AutoSwitchEngine:
             mutator(state)
             atomic_write_json(self.state_path, state)
             return state
+
+    def _clear_manual_override(self) -> None:
+        if self.dry_run:
+            return
+
+        def clear(state: dict) -> None:
+            state.pop("manualOverride", None)
+
+        self._mutate_state(clear)
+
+    def _manual_override_hold(
+        self,
+        state: dict,
+        current: str,
+        entries: dict,
+        usage: dict[str, dict | str | None],
+    ) -> tuple[float, dict[str, float | None]] | None:
+        """Hold a manually selected account for the rest of its quota cycle."""
+        marker = state.get("manualOverride")
+        if not isinstance(marker, dict):
+            return None
+
+        now = self.clock()
+        selected = marker.get("account")
+        selected_at = marker.get("selectedAt")
+        until = marker.get("until")
+        expired = (
+            isinstance(selected_at, (int, float))
+            and now - selected_at >= MANUAL_OVERRIDE_MAX_S
+        )
+        cycle_ended = (
+            isinstance(until, (int, float))
+            and now >= until + RESET_SLACK_S
+        )
+        if selected != current or expired or cycle_ended:
+            self._clear_manual_override()
+            return None
+
+        value = usage.get(current)
+        if not isinstance(value, dict):
+            # Manual intent must not suppress normal unhealthy failover when
+            # the selected account cannot be measured.
+            return None
+
+        decision_headroom = _headroom_by_account(usage, self._decision_models)
+        active_headroom = decision_headroom.get(current)
+        if active_headroom is None:
+            return None
+
+        threshold = self._adaptive_drain_threshold(
+            current,
+            entries.get(current),
+            value,
+            self._decision_models,
+            99.0,
+        )
+        if 100.0 - active_headroom >= threshold:
+            self._clear_manual_override()
+            return None
+
+        if not isinstance(until, (int, float)) and not self.dry_run:
+            reset_at = _consume_reset_ts(value, self._decision_models, now)
+            if reset_at is not None:
+                account = current
+                selected_time = selected_at
+
+                def set_until(latest: dict) -> None:
+                    latest_marker = latest.get("manualOverride")
+                    if (
+                        isinstance(latest_marker, dict)
+                        and latest_marker.get("account") == account
+                        and latest_marker.get("selectedAt") == selected_time
+                    ):
+                        latest_marker["until"] = reset_at
+
+                self._mutate_state(set_until)
+
+        return threshold, decision_headroom
 
     # -- quarantine -----------------------------------------------------------
 
@@ -1172,6 +1284,12 @@ class AutoSwitchEngine:
         self._idle_hold_slow = False
         settings = self.settings
         state = self._read_state()
+        initial_marker = state.get("manualOverride")
+        manual_override_seen = (
+            (initial_marker.get("account"), initial_marker.get("selectedAt"))
+            if isinstance(initial_marker, dict)
+            else None
+        )
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
             # only released (state mutation) on real ticks.
@@ -1225,6 +1343,12 @@ class AutoSwitchEngine:
             )
         else:
             self._decision_models = self._models
+        manual_hold = self._manual_override_hold(
+            state, current, entries, usage
+        )
+        if manual_hold is not None:
+            manual_threshold, headroom = manual_hold
+            settings = replace(settings, threshold=manual_threshold)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1247,6 +1371,20 @@ class AutoSwitchEngine:
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
+
+        if manual_hold is not None:
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            self._emit(
+                NoSwitchEvent(
+                    reason="manual-override",
+                    detail=(
+                        "draining the manually selected account to the "
+                        f"adaptive {pct_label(settings.threshold)}% boundary"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -1647,6 +1785,7 @@ class AutoSwitchEngine:
                     trigger,
                     left_snapshot,
                     bypass_cooldown=urgent_model_rotation,
+                    manual_override_seen=manual_override_seen,
                 )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
@@ -1684,6 +1823,7 @@ class AutoSwitchEngine:
                 trigger,
                 left_snapshot,
                 bypass_cooldown=urgent_model_rotation,
+                manual_override_seen=manual_override_seen,
             )
 
         if systemic or transient_failure:
@@ -2436,6 +2576,7 @@ class AutoSwitchEngine:
         left: tuple[float | None, float],
         *,
         bypass_cooldown: bool = False,
+        manual_override_seen: tuple[object, object] | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2458,6 +2599,35 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
+            marker = state.get("manualOverride")
+            if isinstance(marker, dict):
+                now = self.clock()
+                selected_at = marker.get("selectedAt")
+                until = marker.get("until")
+                fresh = not isinstance(selected_at, (int, float)) or (
+                    now - selected_at < MANUAL_OVERRIDE_MAX_S
+                )
+                in_cycle = not isinstance(until, (int, float)) or (
+                    now < until + RESET_SLACK_S
+                )
+                marker_identity = (
+                    marker.get("account"),
+                    marker.get("selectedAt"),
+                )
+                if (
+                    marker.get("account")
+                    == self.switcher.current_account_number()
+                    and fresh
+                    and in_cycle
+                    and marker_identity != manual_override_seen
+                ):
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="manual-override",
+                            detail="a newer manual selection owns this cycle",
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             if (
                 trigger in ("proactive", "consume-first")
                 and self._in_cooldown(state)
@@ -2497,6 +2667,7 @@ class AutoSwitchEngine:
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
             state["leftTrigger"] = trigger
+            state.pop("manualOverride", None)
             atomic_write_json(self.state_path, state)
 
         self._emit(
