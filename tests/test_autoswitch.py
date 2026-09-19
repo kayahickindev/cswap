@@ -2885,15 +2885,102 @@ class TestTieredModelStrategy:
             })
         )
 
-        outcome = h.tick_with_usage({
-            "1": _tier_usage(0, 78, 99, _R_SOON, _R_SOON),
+        usage = {
+            "1": _tier_usage(0, 78, 90, _R_SOON, _R_SOON),
             "2": _tier_usage(0, 84, 93, _R_LATER, _R_LATER),
             "3": _tier_usage(20, 62, 51, _R_LATEST, _R_LATEST),
-        })
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.state()["manualOverride"]["tier"] == "model"
+
+        usage["1"] = _tier_usage(0, 78, 99, _R_SOON, _R_SOON)
+        outcome = h.tick_with_usage(usage)
 
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
         assert "manualOverride" not in h.state()
+
+    def test_manual_pick_of_model_exhausted_account_holds_on_account_quota(
+        self, temp_home
+    ):
+        # 09-19 incident: the user picked an account whose Fable row was at
+        # 100% but whose 5h/7d windows had room. The hold judged it on Fable,
+        # released on the first tick, and auto moved the user off 18s later.
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+        usage = {
+            "1": _tier_usage(0, 76, 100, _R_LATER, _R_LATER),
+            "2": _tier_usage(0, 78, 99, _R_SOON, _R_SOON),
+            "3": _tier_usage(8, 64, 88, _R_LATEST, _R_LATEST),
+        }
+
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+
+        assert h.active_number() == 1
+        assert h.state()["manualOverride"]["tier"] == "account"
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["manual-override", "manual-override"]
+
+    def test_account_tier_hold_releases_at_account_drain_boundary(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+        usage = {
+            "1": _tier_usage(0, 76, 100, _R_LATER, _R_LATER),
+            "2": _tier_usage(0, 78, 99, _R_SOON, _R_SOON),
+            "3": _tier_usage(8, 64, 88, _R_LATEST, _R_LATEST),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+
+        usage["1"] = _tier_usage(0, 99.5, 100, _R_LATER, _R_LATER)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+        assert h.active_number() == 3
+        assert "manualOverride" not in h.state()
+
+    def test_at_limit_escape_prefers_a_healthy_landing(self, temp_home):
+        # 09-19 incident, second half: the escape ranked a sooner-resetting
+        # account at Fable 99% first, so the next tick switched again.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(0, 76, 100, _R_LATER, _R_LATER),
+            "2": _tier_usage(0, 78, 99, _R_SOON, _R_SOON),
+            "3": _tier_usage(8, 64, 88, _R_LATEST, _R_LATEST),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_at_limit_escape_still_lands_over_the_line_when_nothing_is_healthy(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(100, 40, 10, _R_LATER, _R_LATER),
+            "2": _tier_usage(0, 50, 95, _R_SOON, _R_SOON),
+            "3": _tier_usage(0, 50, 100, _R_LATEST, _R_LATEST),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
 
     def test_manual_override_releases_after_selected_quota_cycle_resets(
         self, temp_home
@@ -2968,7 +3055,8 @@ class TestTieredModelStrategy:
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
 
-        assert h.active_number() == 2
+        # 2 resets sooner but sits over the 90% model line; 3 is healthy.
+        assert h.active_number() == 3
         assert "manualOverride" not in h.state()
 
     def test_fresh_model_mode_holds_until_the_model_threshold(self, temp_home):

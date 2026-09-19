@@ -1038,7 +1038,14 @@ class AutoSwitchEngine:
         entries: dict,
         usage: dict[str, dict | str | None],
     ) -> tuple[float, dict[str, float | None]] | None:
-        """Hold a manually selected account for the rest of its quota cycle."""
+        """Hold a manually selected account for the rest of its quota cycle.
+
+        The hold drains the tier the account was selected in. A pick whose
+        model row already sat at the drain boundary is a deliberate choice of
+        that account's account-wide quota (a model-exhausted account still
+        serves every other model), so it holds on the 5h/7d windows. Judged
+        on the model row, that pick would be released on the very next tick.
+        """
         marker = state.get("manualOverride")
         if not isinstance(marker, dict):
             return None
@@ -1065,38 +1072,65 @@ class AutoSwitchEngine:
             # the selected account cannot be measured.
             return None
 
-        decision_headroom = _headroom_by_account(usage, self._decision_models)
+        tier = marker.get("tier")
+        model_threshold = None
+        if tier not in ("model", "account"):
+            tier = "account"
+            if self._decision_models:
+                model_threshold = self._adaptive_drain_threshold(
+                    current,
+                    entries.get(current),
+                    value,
+                    self._decision_models,
+                    99.0,
+                )
+                model_pct = _scoped_model_pct(value, self._decision_models)
+                if model_pct is None or model_pct < model_threshold:
+                    tier = "model"
+        hold_models = self._decision_models if tier == "model" else ()
+
+        decision_headroom = _headroom_by_account(usage, hold_models)
         active_headroom = decision_headroom.get(current)
         if active_headroom is None:
             return None
 
-        threshold = self._adaptive_drain_threshold(
-            current,
-            entries.get(current),
-            value,
-            self._decision_models,
-            99.0,
+        threshold = (
+            model_threshold
+            if model_threshold is not None and tier == "model"
+            else self._adaptive_drain_threshold(
+                current,
+                entries.get(current),
+                value,
+                hold_models,
+                99.0,
+            )
         )
         if 100.0 - active_headroom >= threshold:
             self._clear_manual_override()
             return None
 
-        if not isinstance(until, (int, float)) and not self.dry_run:
-            reset_at = _consume_reset_ts(value, self._decision_models, now)
-            if reset_at is not None:
-                account = current
-                selected_time = selected_at
+        needs_until = not isinstance(until, (int, float))
+        if (needs_until or marker.get("tier") != tier) and not self.dry_run:
+            reset_at = (
+                _consume_reset_ts(value, self._decision_models, now)
+                if needs_until
+                else None
+            )
+            account = current
+            selected_time = selected_at
 
-                def set_until(latest: dict) -> None:
-                    latest_marker = latest.get("manualOverride")
-                    if (
-                        isinstance(latest_marker, dict)
-                        and latest_marker.get("account") == account
-                        and latest_marker.get("selectedAt") == selected_time
-                    ):
+            def record_cycle(latest: dict) -> None:
+                latest_marker = latest.get("manualOverride")
+                if (
+                    isinstance(latest_marker, dict)
+                    and latest_marker.get("account") == account
+                    and latest_marker.get("selectedAt") == selected_time
+                ):
+                    latest_marker["tier"] = tier
+                    if reset_at is not None:
                         latest_marker["until"] = reset_at
 
-                self._mutate_state(set_until)
+            self._mutate_state(record_cycle)
 
         return threshold, decision_headroom
 
@@ -2295,6 +2329,7 @@ class AutoSwitchEngine:
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
+        over_line: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -2416,9 +2451,19 @@ class AutoSwitchEngine:
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
+            if (
+                trigger in ("at-limit", "failover")
+                and (100.0 - h) >= settings.threshold
+            ):
+                # An escape still takes any account with real headroom, but
+                # one already over the line re-triggers on the next tick: a
+                # second switch inside a minute, since the urgent model
+                # rotation skips the cooldown. Land healthy when anyone can.
+                over_line.append((key, num))
+                continue
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
-        qualifying = qualifying or fallback
+        qualifying = qualifying or fallback or over_line
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
 
