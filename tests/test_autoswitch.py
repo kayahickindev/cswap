@@ -14,6 +14,7 @@ import pytest
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
+    MANUAL_UNMEASURED_GRACE_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,
@@ -30,7 +31,11 @@ from claude_swap.autoswitch import (
     _recovery_is_useful,
     pct_label,
 )
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
@@ -3035,7 +3040,9 @@ class TestTieredModelStrategy:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["manual-override"]
 
-    def test_manual_override_does_not_block_unhealthy_failover(self, temp_home):
+    def test_unmeasured_manual_pick_holds_then_fails_over_after_grace(
+        self, temp_home
+    ):
         h = self._harness(temp_home)
         h.engine._mutate_state(
             lambda state: state.update({
@@ -3051,6 +3058,19 @@ class TestTieredModelStrategy:
             "3": _tier_usage(20, 62, 51, _R_LATEST, _R_LATEST),
         }
 
+        # A fresh login reads as unknown for a while: the pick holds.
+        for _ in range(5):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        assert h.active_number() == 1
+        details = [
+            e.detail for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "manual-override"
+        ]
+        assert details and all("unreadable" in d for d in details)
+
+        # Still unreadable past the grace window: normal failover resumes.
+        h.clock.advance(MANUAL_UNMEASURED_GRACE_S)
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
@@ -3058,6 +3078,65 @@ class TestTieredModelStrategy:
         # 2 resets sooner but sits over the 90% model line; 3 is healthy.
         assert h.active_number() == 3
         assert "manualOverride" not in h.state()
+
+    def test_rejected_manual_pick_fails_over_without_grace(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {
+                    "account": "1",
+                    "selectedAt": h.clock(),
+                }
+            })
+        )
+        usage = {
+            "1": USAGE_RELOGIN_REQUIRED,
+            "2": _tier_usage(0, 84, 93, _R_LATER, _R_LATER),
+            "3": _tier_usage(20, 62, 51, _R_LATEST, _R_LATEST),
+        }
+
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_login_outside_cswap_counts_as_manual_pick(self, temp_home):
+        h = self._harness(temp_home)
+        usage = {
+            "1": _tier_usage(10, 20, 10, _R_LATEST, _R_LATEST),
+            "2": _tier_usage(10, 20, 10, _R_LATEST, _R_LATEST),
+            "3": _tier_usage(10, 20, 10, _R_LATEST, _R_LATEST),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert "manualOverride" not in h.state()
+
+        # Claude Code `/login` as account 2; its usage is not readable yet.
+        h.make_live("b@example.com", 2)
+        usage["2"] = None
+        for _ in range(4):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+
+        assert h.switcher.current_account_number() == "2"
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        marker = h.state()["manualOverride"]
+        assert marker["account"] == "2"
+        assert marker["source"] == "external"
+
+    def test_daemon_switch_is_not_mistaken_for_a_manual_pick(self, temp_home):
+        h = self._harness(temp_home)
+        usage = {
+            "1": _tier_usage(10, 20, 90, _R_LATEST, _R_LATER),
+            "2": _tier_usage(10, 20, 20, _R_LATEST, _R_SOON),
+            "3": _tier_usage(10, 20, 10, _R_LATEST, _R_LATEST),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.clock.advance(60)
+        h.tick_with_usage(usage)
+        assert "manualOverride" not in h.state()
+        assert h.state()["lastSeenActive"] == "2"
 
     def test_fresh_model_mode_holds_until_the_model_threshold(self, temp_home):
         h = self._harness(temp_home)
@@ -6215,6 +6294,9 @@ class TestHorizonAxisDoesNotFlap:
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
+            # Each case is a fresh setup; the shared temp_home must not carry
+            # the previous case's scheduler state into it.
+            (h.switcher.backup_dir / "autoswitch_state.json").unlink(missing_ok=True)
 
             outcome = None
             for _ in range(3):  # unhealthy_ticks default is 3
@@ -6298,6 +6380,9 @@ class TestHorizonAxisDoesNotFlap:
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
+            # Each case is a fresh setup; the shared temp_home must not carry
+            # the previous case's scheduler state into it.
+            (h.switcher.backup_dir / "autoswitch_state.json").unlink(missing_ok=True)
 
             outcome = None
             for _ in range(3):  # unhealthy_ticks default is 3

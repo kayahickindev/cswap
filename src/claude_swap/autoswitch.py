@@ -44,7 +44,11 @@ from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    SCHEMA_VERSION,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -58,6 +62,12 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
 MANUAL_OVERRIDE_MAX_S = 8 * 24 * 3600.0
+# How long a manual pick holds while its usage cannot be read. A fresh
+# `/login` (or a slot whose stored token went stale) reads as unknown for a
+# few ticks; failing over on that bounced a deliberate pick within 3
+# minutes (10-13). Past this window the normal unhealthy failover resumes,
+# so a pick that is truly broken is still escaped.
+MANUAL_UNMEASURED_GRACE_S = 30 * 60.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -802,6 +812,9 @@ class AutoSwitchEngine:
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
         self._unhealthy_ticks = 0
+        # (pick, since): when the current manual pick first read as
+        # unmeasured; bounds the hold in ``_manual_override_hold``.
+        self._manual_unmeasured: tuple[tuple, float] | None = None
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -1031,13 +1044,46 @@ class AutoSwitchEngine:
 
         self._mutate_state(clear)
 
+    def _adopt_external_pick(self, current: str) -> dict:
+        """Treat an account change cswap did not make as a manual pick.
+
+        A Claude Code ``/login`` swaps the live account without going through
+        ``cswap switch``, so no marker was written and the daemon moved the
+        user straight back off the account they chose (10-13). The state file
+        remembers the active account the last tick saw; a different one now,
+        with no marker naming it, was chosen by the user. The first tick after
+        an upgrade only records what it sees.
+        """
+        def record(latest: dict) -> None:
+            seen = latest.get("lastSeenActive")
+            latest["lastSeenActive"] = current
+            marker = latest.get("manualOverride")
+            if (
+                seen is not None
+                and seen != current
+                and not (
+                    isinstance(marker, dict)
+                    and marker.get("account") == current
+                )
+            ):
+                latest["manualOverride"] = {
+                    "account": current,
+                    "selectedAt": self.clock(),
+                    "source": "external",
+                }
+
+        state = self._read_state()
+        if state.get("lastSeenActive") == current:
+            return state
+        return self._mutate_state(record)
+
     def _manual_override_hold(
         self,
         state: dict,
         current: str,
         entries: dict,
         usage: dict[str, dict | str | None],
-    ) -> tuple[float, dict[str, float | None]] | None:
+    ) -> tuple[float | None, dict[str, float | None]] | None:
         """Hold a manually selected account for the rest of its quota cycle.
 
         The hold drains the tier the account was selected in. A pick whose
@@ -1045,6 +1091,10 @@ class AutoSwitchEngine:
         that account's account-wide quota (a model-exhausted account still
         serves every other model), so it holds on the 5h/7d windows. Judged
         on the model row, that pick would be released on the very next tick.
+
+        A pick whose usage cannot be read holds for
+        ``MANUAL_UNMEASURED_GRACE_S`` with a ``None`` threshold (nothing to
+        drain against yet).
         """
         marker = state.get("manualOverride")
         if not isinstance(marker, dict):
@@ -1068,9 +1118,22 @@ class AutoSwitchEngine:
 
         value = usage.get(current)
         if not isinstance(value, dict):
-            # Manual intent must not suppress normal unhealthy failover when
-            # the selected account cannot be measured.
-            return None
+            # A fresh login reads as unknown for a few ticks, so an unmeasured
+            # pick holds instead of failing over. A token the server rejected
+            # outright, or a pick still unmeasured past the grace window,
+            # falls through to the normal unhealthy failover.
+            if value == USAGE_RELOGIN_REQUIRED:
+                return None
+            pick = (selected, selected_at)
+            if (
+                self._manual_unmeasured is None
+                or self._manual_unmeasured[0] != pick
+            ):
+                self._manual_unmeasured = (pick, now)
+            if now - self._manual_unmeasured[1] >= MANUAL_UNMEASURED_GRACE_S:
+                return None
+            return None, _headroom_by_account(usage, self._decision_models)
+        self._manual_unmeasured = None
 
         tier = marker.get("tier")
         model_threshold = None
@@ -1357,6 +1420,15 @@ class AutoSwitchEngine:
                 )
             return TickOutcome.NO_ACTION
 
+        if not self.dry_run:
+            state = self._adopt_external_pick(current)
+            marker = state.get("manualOverride")
+            manual_override_seen = (
+                (marker.get("account"), marker.get("selectedAt"))
+                if isinstance(marker, dict)
+                else None
+            )
+
         current_email = self.switcher.account_email(current)
         active_ref = _ref(current, current_email) if current_email else {
             "number": int(current),
@@ -1382,7 +1454,8 @@ class AutoSwitchEngine:
         )
         if manual_hold is not None:
             manual_threshold, headroom = manual_hold
-            settings = replace(settings, threshold=manual_threshold)
+            if manual_threshold is not None:
+                settings = replace(settings, threshold=manual_threshold)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1415,6 +1488,9 @@ class AutoSwitchEngine:
                     detail=(
                         "draining the manually selected account to the "
                         f"adaptive {pct_label(settings.threshold)}% boundary"
+                        if manual_threshold is not None
+                        else "holding the manually selected account while "
+                        "its usage is unreadable"
                     ),
                 )
             )
@@ -2694,6 +2770,7 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            state["lastSeenActive"] = number
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present
