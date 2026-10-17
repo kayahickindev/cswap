@@ -13,6 +13,8 @@ from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    USAGE_NO_CREDENTIALS,
+    USAGE_TOKEN_EXPIRED,
     account_row,
     error_envelope,
     usage_fields,
@@ -173,6 +175,19 @@ class TestJsonHelpers:
         row = account_row(1, "a@x.com", "", "", True, None)
         assert "alias" not in row
 
+    def test_account_row_includes_login_expiry_when_known(self):
+        from claude_swap.json_output import account_row
+
+        row = account_row(
+            1, "a@x.com", "", "", True, None, login_expires_at="2026-10-08T01:06:36Z"
+        )
+        assert row["loginExpiresAt"] == "2026-10-08T01:06:36Z"
+
+    def test_account_row_omits_login_expiry_when_unknown(self):
+        from claude_swap.json_output import account_row
+
+        assert "loginExpiresAt" not in account_row(1, "a@x.com", "", "", True, None)
+
 
 # --------------------------------------------------------------------------- #
 # --list --json
@@ -244,6 +259,32 @@ class TestListJson:
         by_num = {a["number"]: a for a in payload["accounts"]}
         assert by_num[1]["alias"] == "dev"
         assert "alias" not in by_num[2]
+
+    def test_list_payload_reports_login_expiry_from_the_stored_credential(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """``loginExpiresAt`` comes from ``refreshTokenExpiresAt`` on each slot's own
+        credential, and is absent for a login that never recorded one."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-backup", "refreshTokenExpiresAt": 1791421596865,
+        }})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert "loginExpiresAt" not in by_num[1]
+        assert by_num[2]["loginExpiresAt"] == "2026-10-08T01:06:36Z"
 
     def test_usage_status_no_credentials_and_unavailable(
         self, temp_home: Path, mock_claude_config: Path,
@@ -324,6 +365,9 @@ class TestListJson:
             assert row["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
             assert row["lastGoodAgeSeconds"] >= age_s
             assert row["lastGoodFetchedAt"].endswith("Z")
+            # The failed refetch is why the row is unavailable, so it says so.
+            assert row["usageError"] == "timeout"
+            assert row["usageRetryAt"].endswith("Z")
 
 
 # --------------------------------------------------------------------------- #
@@ -386,6 +430,8 @@ class TestStatusJson:
             last_good={"five_hour": {"pct": 25.0}},
             fetched_at=fetched_at,
             age_s=4000.0,
+            last_error="http-429",
+            backoff_until=time_mod.time() + 3600,
         )
 
         with patch.object(switcher, "_read_active_credentials",
@@ -398,6 +444,8 @@ class TestStatusJson:
         assert active["usage"] is None
         assert active["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
         assert active["lastGoodAgeSeconds"] == 4000.0
+        assert active["usageError"] == "http-429"
+        assert active["usageRetryAt"].endswith("Z")
 
     def test_status_managed_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,
@@ -657,6 +705,43 @@ class TestSwitchJson:
         assert result["from"] == {"number": None, "email": "test@example.com"}
 
 
+class TestAccountRowFailure:
+    """The additive ``usageError``/``usageRetryAt`` fields on --list rows."""
+
+    def test_unavailable_row_names_its_failure_and_retry(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            last_error="http-429", backoff_until=1_800_000_000.0,
+        )
+        assert row["usageStatus"] == "unavailable"
+        assert row["usageError"] == "http-429"
+        assert row["usageRetryAt"] == "2027-01-15T08:00:00Z"
+
+    def test_lapsed_backoff_leaves_only_the_error(self):
+        row = account_row(2, "b@example.com", "", "", False, None, last_error="timeout")
+        assert row["usageError"] == "timeout"
+        assert "usageRetryAt" not in row
+
+    def test_no_failure_adds_nothing(self):
+        row = account_row(2, "b@example.com", "", "", False, None)
+        assert "usageError" not in row
+        assert "usageRetryAt" not in row
+
+    @pytest.mark.parametrize(
+        "entry", [{"five_hour": {"pct": 5.0}}, USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS]
+    )
+    def test_explained_rows_do_not_repeat_an_old_failure(self, entry):
+        """A served measurement or a sentinel already says what the row is;
+        a failure left over from an earlier pass would only contradict it."""
+        row = account_row(
+            2, "b@example.com", "", "", False, entry,
+            usage_fetched_at=1_800_000_000.0,
+            last_error="http-429", backoff_until=1_800_000_000.0,
+        )
+        assert "usageError" not in row
+        assert "usageRetryAt" not in row
+
+
 class TestAccountRowDisabled:
     """The additive ``disabled`` field on --list rows."""
 
@@ -667,3 +752,52 @@ class TestAccountRowDisabled:
     def test_disabled_absent_by_default(self):
         row = account_row(1, "a@example.com", "", "", False, None)
         assert "disabled" not in row
+
+
+class TestUsageFromJson:
+    """``list --json`` usage read back into the internal dict (import-usage)."""
+
+    INTERNAL = {
+        "five_hour": {"pct": 12.0, "resets_at": "2099-01-01T05:00:00+00:00"},
+        "seven_day": {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
+        "spend": {"used": 5.0, "limit": 50.0, "pct": 10.0, "currency": "USD",
+                  "resets_at": "2099-02-01T00:00:00+00:00"},
+        "scoped": [{"name": "Fable", "pct": 30.0,
+                    "resets_at": "2099-01-07T00:00:00+00:00"}],
+    }
+
+    def test_round_trips_what_the_api_measured(self):
+        import time
+
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        back = usage_from_json(usage_to_json(self.INTERNAL, fetched_at=time.time()))
+        # Pace fields are dropped; countdown/clock are rebuilt from resets_at,
+        # the way a fresh fetch writes them.
+        windows = (back["five_hour"], back["seven_day"], back["spend"], back["scoped"][0])
+        for window in windows:
+            assert window.pop("countdown") and window.pop("clock")
+        assert back == self.INTERNAL
+
+    def test_a_window_without_a_reset_keeps_its_pct(self):
+        from claude_swap.json_output import usage_from_json
+
+        assert usage_from_json({"fiveHour": {"pct": 3}}) == {"five_hour": {"pct": 3.0}}
+
+    @pytest.mark.parametrize("usage", [
+        None,
+        {},
+        {"fiveHour": {"pct": "12"}},
+        {"fiveHour": {"pct": -1}},
+        {"fiveHour": {"pct": float("nan")}},
+        {"fiveHour": {"pct": True}},
+        {"sevenDay": {"pct": 1, "resetsAt": "next tuesday"}},
+        {"spend": {"pct": 1, "used": 1, "currency": "USD"}},
+        {"scoped": [{"pct": 1}]},
+        {"scoped": {"name": "Fable", "pct": 1}},
+    ])
+    def test_malformed_usage_is_refused(self, usage):
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError):
+            usage_from_json(usage)

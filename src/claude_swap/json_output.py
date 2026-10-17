@@ -8,6 +8,7 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
@@ -132,6 +133,80 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     return out
 
 
+def _is_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _window_from_json(window: object, label: str) -> dict:
+    """One JSON window back to the internal shape, fetch-time strings rebuilt."""
+    if not isinstance(window, dict):
+        raise ValueError(f"{label} must be an object")
+    pct = window.get("pct")
+    if not _is_number(pct) or pct < 0:
+        raise ValueError(f"{label}.pct must be a non-negative number")
+    out: dict = {"pct": float(pct)}
+    resets_at = window.get("resetsAt")
+    if resets_at is not None:
+        if not isinstance(resets_at, str):
+            raise ValueError(f"{label}.resetsAt must be an ISO-8601 string")
+        try:
+            out["countdown"], out["clock"] = oauth.format_reset(resets_at)
+        except (ValueError, TypeError):
+            raise ValueError(f"{label}.resetsAt is not an ISO-8601 time: {resets_at!r}")
+        out["resets_at"] = resets_at
+    return out
+
+
+def usage_from_json(usage: object) -> dict:
+    """Read a ``usage`` object from ``list --json`` back into the internal dict.
+
+    The inverse of :func:`usage_to_json` for what the API measured: ``pct``,
+    ``resetsAt``, the spend amounts and the scoped model names. Everything
+    derived at serialization (countdown, clock, pace fields) is dropped, and
+    the fetch-time strings are rebuilt from ``resets_at``, which gives the
+    shape :func:`oauth.build_usage_result` stores. Raises ``ValueError`` on
+    anything malformed, so an importer can refuse a document before writing
+    any of it.
+    """
+    if not isinstance(usage, dict):
+        raise ValueError("usage must be an object")
+    out: dict = {}
+    if "fiveHour" in usage:
+        out["five_hour"] = _window_from_json(usage["fiveHour"], "fiveHour")
+    if "sevenDay" in usage:
+        out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
+    if "spend" in usage:
+        spend = usage["spend"]
+        out_spend = _window_from_json(spend, "spend")
+        for key in ("used", "limit"):
+            if not _is_number(spend.get(key)):
+                raise ValueError(f"spend.{key} must be a number")
+            out_spend[key] = float(spend[key])
+        if not isinstance(spend.get("currency"), str):
+            raise ValueError("spend.currency must be a string")
+        out_spend["currency"] = spend["currency"]
+        out["spend"] = out_spend
+    if "scoped" in usage:
+        if not isinstance(usage["scoped"], list):
+            raise ValueError("scoped must be a list")
+        scoped = []
+        for i, window in enumerate(usage["scoped"]):
+            label = f"scoped[{i}]"
+            entry = _window_from_json(window, label)
+            name = window.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{label}.name must be a non-empty string")
+            scoped.append({"name": name, **entry})
+        out["scoped"] = scoped
+    if not out:
+        raise ValueError("usage carries no windows")
+    return out
+
+
 def usage_fields(
     entry: dict | str | None, fetched_at: float | None = None
 ) -> tuple[str, dict | None]:
@@ -140,7 +215,8 @@ def usage_fields(
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
     (active token expired and the refresh was deferred this pass — lock
     contention, unattributable lineage, or a failed persist; retried
-    automatically), the ``USAGE_API_KEY`` sentinel
+    automatically — or a live session's credential refused, which only that
+    session may renew), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
@@ -180,16 +256,34 @@ def usage_freshness_fields(
     ``lastGoodFetchedAt``/``lastGoodAgeSeconds`` for null-``usage`` rows."""
     if fetched_at is None:
         return {}
-    fields: dict = {
-        "usageFetchedAt": (
-            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
-    }
+    fields: dict = {"usageFetchedAt": _timestamp(fetched_at)}
     if age_s is not None:
         fields["usageAgeSeconds"] = round(age_s, 1)
     return fields
+
+
+def _timestamp(epoch_s: float) -> str:
+    return (
+        datetime.fromtimestamp(epoch_s, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def usage_failure_fields(
+    status: str, last_error: str | None, backoff_until: float | None
+) -> dict:
+    """Additive ``usageError``/``usageRetryAt`` fields for a row that is
+    ``unavailable`` with nothing else to say for itself: the last fetch
+    failure by kind (``http-429``, ``timeout``, ...) and, while the store is
+    backing off from it, when the next attempt is due. Every other status
+    already explains the null ``usage``, so nothing is added to it."""
+    if status != "unavailable" or not last_error:
+        return {}
+    out = {"usageError": last_error}
+    if backoff_until is not None:
+        out["usageRetryAt"] = _timestamp(backoff_until)
+    return out
 
 
 def last_good_usage_fields(
@@ -219,10 +313,14 @@ def account_row(
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
     last_good_usage: dict | None = None,
+    last_error: str | None = None,
+    backoff_until: float | None = None,
     alias: str = "",
     disabled: bool = False,
+    login_expires_at: str | None = None,
 ) -> dict:
-    """A full account row for ``--list``."""
+    """A full account row for ``--list``. ``backoff_until`` is the live
+    backoff only; a lapsed one is the caller's to withhold."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -240,6 +338,11 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive field: when the stored login records the expiry of its refresh
+    # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
+    # ``relogin_required`` that follows; absent when the login carries none.
+    if login_expires_at:
+        row["loginExpiresAt"] = login_expires_at
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
@@ -248,6 +351,7 @@ def account_row(
                 last_good_usage, usage_fetched_at, usage_age_s
             )
         )
+        row.update(usage_failure_fields(status, last_error, backoff_until))
     return row
 
 

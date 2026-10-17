@@ -135,7 +135,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 
 Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
   
-A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account.
+A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account. While a session runs, its account's usage is read with the session's own credential and never refreshed by cswap; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
 
 <details>
 <summary>Sharing details — MCP servers & chat history</summary>
@@ -303,6 +303,21 @@ The export file is plaintext JSON and, by default, carries only each account's o
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
 
+### Share usage readings between machines
+
+Machines that hold the same accounts can end up spending one usage-endpoint budget: when they share a login (moved between them with `export`/`import`, so the same token is live on each), or when the account's usage requests are limited per account rather than per token. Their polling then adds up. `import-usage` lets one machine poll and hand its readings to the others:
+
+```bash
+cswap list --json | ssh laptop cswap import-usage - --hold 600
+```
+
+<details>
+<summary>How it works — matching, holds & when a hold ends</summary>
+
+The input is `cswap list --json` output. Each row with `usageStatus: "ok"` is matched to a local account by email and organization, and adopted when it is newer than the reading already stored. Its age comes from `usageAgeSeconds`, so the two machines' clocks never have to agree; a script that delays the hand-over should add the delay to that field. `--hold SECONDS` keeps every collector on the receiving machine (`list`, `status`, `auto`, the dashboard, the menu bar) from fetching those accounts for that long, and the held reading stays trusted for switch decisions meanwhile. A hold never runs past the reading's earliest window reset (per-model windows included), nor past an hour after the reading was taken. Renew it with each hand-over, or lift it early with `--hold 0`; when it lapses, the machine goes back to fetching for itself.
+
+</details>
+
 ### JSON output for scripting
 
 Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
@@ -331,7 +346,9 @@ cswap switch 2 --json
 
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
 
-Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
+Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (e.g. `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
+
+A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
@@ -344,13 +361,14 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
-or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+or a Console API key (`sk-ant-api03-...` workspace key, `sk-ant-usr-...` personal
+key, or a service-account key) and you don't want to log in via the browser
 flow first — useful on headless servers or when receiving a token from another
 machine — register it directly. The token type is auto-detected:
 
 ```bash
 cswap add-token sk-ant-oat01-...             # OAuth setup-token
-cswap add-token sk-ant-api03-...             # managed API key
+cswap add-token sk-ant-api03-...             # API key (any Console key family)
 cswap add-token sk-ant-oat01-... --slot 3
 cswap add-token - --slot 3                   # read token from stdin
 cswap add-token --email user@example.com     # optional label override
@@ -359,11 +377,14 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
-**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
-(the kind Claude Code uses after `/login` with a key) rather than an OAuth
-setup-token. It switches like any other account; since API keys have no subscription
-quota, they show no usage and the usage-aware `switch` strategies never skip them as
-rate-limited.
+**API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
+(`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses
+after `/login` with a key) rather than an OAuth setup-token. It switches like any
+other account; since API keys have no subscription quota, they show no usage and the
+usage-aware `switch` strategies never skip them as rate-limited. Create personal and
+service-account keys scoped to a single workspace: a multi-workspace key needs an
+`anthropic-workspace-id` header on every request, which Claude Code does not add for
+a stored key.
 
 ## Uninstall
 
