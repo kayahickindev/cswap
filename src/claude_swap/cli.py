@@ -312,6 +312,113 @@ Examples:
         sys.exit(130)
 
 
+def _desktop_command(argv: list[str]) -> None:
+    """Handle `cswap desktop [status|connect|new|switch|on|off] [NUM|EMAIL]`.
+
+    Makes the Claude desktop app follow cswap's active account (macOS). Each
+    account is connected once; after that a manual switch also switches the
+    app, and `cswap auto` switches it whenever the app is closed.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap desktop",
+        description=(
+            "Make the Claude desktop app follow the active account. Connect "
+            "each account once; a manual switch then quits, switches and "
+            "relaunches the app, and `cswap auto` switches it while it is closed."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Connect your accounts once:
+  cswap desktop connect 2       # the app is signed in as account 2 right now
+  cswap desktop new             # park that sign-in, reopen the app signed out
+  cswap desktop connect 4       # after signing the app in as account 4
+
+Then:
+  cswap desktop                 # status
+  cswap desktop switch          # put the app on the active account now
+  cswap desktop off             # stop following (on to resume)
+        """,
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=("status", "connect", "new", "switch", "on", "off"),
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account for connect/switch (default: the active account)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.desktop import DesktopFollower, account_key
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        follower = DesktopFollower(switcher.backup_dir)
+
+        def target() -> tuple[str, str]:
+            if args.account:
+                _, email, org_uuid = switcher.resolve_account(args.account)
+                return email, org_uuid
+            identity = switcher._get_current_account()
+            if identity is None:
+                raise ClaudeSwitchError("No active account; name one (NUM|EMAIL)")
+            return identity
+
+        if args.action == "status":
+            state = follower.load()
+            print(f"Desktop follow: {accent('on') if state['enabled'] else muted('off')}")
+            accounts = state["accounts"]
+            if not accounts:
+                print(dimmed("No accounts connected. Start with: cswap desktop connect <NUM|EMAIL>"))
+                return
+            live = switcher._get_current_account()
+            live_key = account_key(*live) if live else None
+            for key, entry in sorted(accounts.items(), key=lambda kv: kv[1].get("email", "")):
+                tags = []
+                if key == state["current"]:
+                    tags.append(accent("in the app"))
+                if key == state["pending"]:
+                    tags.append("waiting for the app to close")
+                if key == live_key:
+                    tags.append("active in Claude Code")
+                suffix = f"  ({', '.join(tags)})" if tags else ""
+                print(f"  {entry.get('email', key)}{suffix}")
+            if state["current"] is None:
+                print(dimmed("The app's current sign-in is not connected yet."))
+            return
+
+        if args.action in ("on", "off"):
+            follower.set_enabled(args.action == "on")
+            print(f"Desktop follow: {args.action}")
+            return
+
+        if args.action == "new":
+            result = follower.new_login()
+        elif args.action == "connect":
+            email, org_uuid = target()
+            result = follower.connect(email, org_uuid)
+        else:
+            email, org_uuid = target()
+            result = follower.follow(email, org_uuid, allow_restart=True)
+
+        if result["action"] in ("skipped", "error"):
+            error(f"Desktop app: {result['detail']}")
+            sys.exit(1)
+        print(f"{accent('Desktop app:')} {result['detail']}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _unmap_command(argv: list[str]) -> None:
     """Handle `cswap unmap [PATH]` — remove a directory→account mapping."""
     parser = argparse.ArgumentParser(
@@ -1017,6 +1124,9 @@ def main() -> None:
     if argv and argv[0] == "unmap":
         _unmap_command(argv[1:])
         return
+    if argv and argv[0] == "desktop":
+        _desktop_command(argv[1:])
+        return
     if argv and argv[0] == "unclaimed":
         _unclaimed_command(argv[1:])
         return
@@ -1068,6 +1178,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s desktop [connect|new|switch] make the Claude desktop app follow (macOS)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

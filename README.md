@@ -165,6 +165,20 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Make the Claude desktop app follow (macOS)
+
+The desktop app keeps one sign-in. cswap can keep one per account and move the app onto whichever account Claude Code is using. Connect each account once:
+
+```bash
+cswap desktop connect 2       # the app is signed in as account 2 right now
+cswap desktop new             # park that sign-in and reopen the app signed out
+cswap desktop connect 4       # after signing the app in as account 4
+```
+
+After that, a manual `cswap switch` quits the app, moves it to the new account and reopens it (a few seconds). `cswap auto` never restarts an open app, because it cannot tell whether a chat is mid-reply; it switches the app the next time it finds it closed. `cswap desktop` shows the status, `cswap desktop switch` moves the app now, and `cswap desktop off` stops following.
+
+Each account's sign-in files are parked under `~/.claude-swap-backup/desktop/logins/` and moved in and out by rename, so nothing is copied. The Cowork VM, caches, MCP server config and Code-tab session list stay shared. This uses the app's undocumented storage, so an app update can break it; a failure is logged and never blocks the Claude Code switch.
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.

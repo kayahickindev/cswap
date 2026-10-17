@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import desktop, oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -2988,6 +2988,9 @@ class AutoSwitchEngine:
                     ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                 )
                 outcome = TickOutcome.ERROR
+            # The desktop app follows the live account whenever it is closed;
+            # a tick never restarts a running app (a chat may be mid-reply).
+            desktop.follow_active(self.switcher, allow_restart=False)
             delay = self._next_delay(outcome)
             if delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)

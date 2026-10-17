@@ -6279,9 +6279,10 @@ class ClaudeAccountSwitcher:
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict | None:
         """Select one account and temporarily override autoswitch."""
+        from claude_swap import desktop
         from claude_swap.autoswitch import run_manual_switch
 
-        return run_manual_switch(
+        result = run_manual_switch(
             self,
             lambda: self.switch_to(
                 identifier,
@@ -6289,6 +6290,13 @@ class ClaudeAccountSwitcher:
                 force=force,
             ),
         )
+        followed = desktop.follow_active(self, allow_restart=True)
+        if followed and followed["action"] in ("switched", "skipped", "error"):
+            if json_output and isinstance(result, dict):
+                result["desktop"] = followed
+            elif not json_output:
+                print(dimmed(f"Desktop app: {followed['detail']}"))
+        return result
 
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
