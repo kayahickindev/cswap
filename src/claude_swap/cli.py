@@ -419,6 +419,75 @@ Then:
         sys.exit(130)
 
 
+def _chrome_command(argv: list[str]) -> None:
+    """Handle `cswap chrome [status|setup|test|undo]`.
+
+    Pins Claude Code's Chrome connection to one claude.ai account (the
+    extension's), so switching the session's account no longer cuts Chrome off.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap chrome",
+        description=(
+            "Keep Claude Code's Chrome connection on the Chrome extension's account, "
+            "whichever account your sessions use. Runs Claude Code's Chrome tools as a "
+            "separate MCP server with its own sign-in."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap chrome setup            # one-time: sign in, add the server, turn off the built-in tools
+  cswap chrome status           # pinned account, server and built-in default
+  cswap chrome test             # which browsers the pinned account can reach
+  cswap chrome setup --relogin  # the extension moved to another account
+  cswap chrome undo             # remove it and restore the earlier setting
+        """,
+    )
+    parser.add_argument(
+        "action", nargs="?", default="status",
+        choices=("status", "setup", "test", "undo"),
+    )
+    parser.add_argument("--relogin", action="store_true", help="setup: sign in again (change the pinned account)")
+    parser.add_argument("--force", action="store_true", help="setup: replace a different server that uses the name")
+    parser.add_argument("--keep-login", action="store_true", help="undo: keep the pinned sign-in")
+    args = parser.parse_args(argv)
+
+    from claude_swap.chrome import ChromePin, ChromePinError
+
+    pin = ChromePin()
+    try:
+        if args.action == "status":
+            account = pin.pinned_account()
+            state = pin.server_state()
+            print(f"Pinned sign-in folder: {pin.pin_dir}")
+            print(f"Pinned account:        {account.describe() if account else muted('not signed in (run: cswap chrome setup)')}")
+            print("MCP server:            " + {
+                "ours": f"'{pin.server_name}' is configured",
+                "ours-stale": f"'{pin.server_name}' is configured but outdated (run setup to refresh it)",
+                "other": f"a different server is already named '{pin.server_name}'",
+            }.get(state, f"'{pin.server_name}' is not configured"))
+            print(f"Built-in Chrome tools by default: {pin.builtin_default()}")
+        elif args.action == "setup":
+            browsers = pin.setup(relogin=args.relogin, force=args.force)
+            print()
+            print(
+                f"{accent('Done.')} New sessions get the browser tools as "
+                f"mcp__{pin.server_name}__*. Restart sessions that are already open."
+            )
+            if not browsers:
+                sys.exit(2)
+        elif args.action == "test":
+            if not pin.test():
+                sys.exit(2)
+        else:
+            pin.undo(keep_login=args.keep_login)
+    except ChromePinError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _unmap_command(argv: list[str]) -> None:
     """Handle `cswap unmap [PATH]` — remove a directory→account mapping."""
     parser = argparse.ArgumentParser(
@@ -1127,6 +1196,9 @@ def main() -> None:
     if argv and argv[0] == "desktop":
         _desktop_command(argv[1:])
         return
+    if argv and argv[0] == "chrome":
+        _chrome_command(argv[1:])
+        return
     if argv and argv[0] == "unclaimed":
         _unclaimed_command(argv[1:])
         return
@@ -1179,6 +1251,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s desktop [connect|new|switch] make the Claude desktop app follow (macOS)
+  %(prog)s chrome [setup|status|test] keep Chrome on one account while sessions switch
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

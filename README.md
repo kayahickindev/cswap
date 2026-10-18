@@ -1,4 +1,20 @@
-# claude-swap
+# cswap
+
+A fork of [claude-swap](https://github.com/realiti4/claude-swap) by Onur Cetinkol, kept in sync with it, with three additions:
+
+- **`cswap chrome`: Chrome keeps working when your account changes.** The Claude in Chrome extension only connects to a session signed into the same claude.ai account, and Claude Code's built-in Chrome tools connect as the session's account, so a switch cuts Chrome off. `cswap chrome setup` runs Claude Code's Chrome tools as a separate MCP server with its own permanent sign-in on the extension's account. See [Keep Chrome connected](#keep-chrome-connected-when-the-account-changes).
+- **Model-aware switching and manual picks that stick.** The `tiered` strategy also watches a model's own weekly limit (for example `--model Fable`), and an account you pick by hand (`cswap switch`, or a `/login` in Claude Code) is held instead of being switched away on the next tick.
+- **`cswap desktop` (experimental): the Claude desktop app follows the active account.** It's covered by tests but hasn't been tried on a real desktop app yet.
+
+Install it in place of claude-swap (they share the `cswap` command):
+
+```bash
+uv tool install --force "claude-swap[menubar] @ git+https://github.com/kayahickindev/cswap"
+```
+
+Everything else below is claude-swap's own documentation.
+
+---
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
@@ -177,7 +193,34 @@ cswap desktop connect 4       # after signing the app in as account 4
 
 After that, a manual `cswap switch` quits the app, moves it to the new account and reopens it (a few seconds). `cswap auto` never restarts an open app, because it cannot tell whether a chat is mid-reply; it switches the app the next time it finds it closed. `cswap desktop` shows the status, `cswap desktop switch` moves the app now, and `cswap desktop off` stops following.
 
-Each account's sign-in files are parked under `~/.claude-swap-backup/desktop/logins/` and moved in and out by rename, so nothing is copied. The Cowork VM, caches, MCP server config and Code-tab session list stay shared. This uses the app's undocumented storage, so an app update can break it; a failure is logged and never blocks the Claude Code switch.
+Each account's sign-in files are parked under `~/.claude-swap-backup/desktop/logins/` and moved in and out by rename, so nothing is copied. The Cowork VM, caches, MCP server config and Code-tab session list stay shared. This uses the app's undocumented storage, so an app update can break it; a failure is logged and never blocks the Claude Code switch. This feature is experimental: it is covered by tests but has not yet been tried against a real desktop app.
+
+### Keep Chrome connected when the account changes
+
+The Claude in Chrome extension only connects to a session signed into the same claude.ai account as the extension, and Claude Code's built-in Chrome tools connect as the session's account. So after a switch you get "Browser extension is not connected", and `/chrome` → Reconnect only lasts until the next one.
+
+Claude Code can also run its Chrome tools as a separate MCP server (`claude --claude-in-chrome-mcp`), which connects to Chrome with its own sign-in. `cswap chrome` gives that server a permanent sign-in on the extension's account:
+
+```bash
+cswap chrome setup     # one time
+cswap chrome status    # pinned account, server, built-in default
+cswap chrome test      # which browsers the pinned account can reach
+cswap chrome undo      # remove it and restore the earlier setting
+```
+
+`setup`:
+
+1. Signs a separate folder (`~/.claude-chrome`) into the account your Chrome extension uses. The sign-in page uses whichever claude.ai account your browser is logged into, so check that first. This is an independent sign-in, never a copy of an account cswap manages: two copies of one login refresh against each other and the loser stops working.
+2. Adds a user-level MCP server named `chrome` that runs the Chrome tools with that folder. Sign-in variables in the environment (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`) are removed for it, so they can't override the pinned sign-in.
+3. Turns off the built-in Chrome tools by default (`claudeInChromeDefaultEnabled`), so sessions load one set of browser tools. The earlier setting is saved, and `undo` puts it back.
+
+New sessions get the tools as `mcp__chrome__*`; open sessions keep the old ones until they restart. Good to know:
+
+- **Organization policy.** Whether Claude in Chrome is allowed is decided by the pinned account's organization. If the organization your sessions are signed into has turned off Claude in Chrome, don't use this to get around that; `setup` points it out when the two organizations differ.
+- **Model usage.** Your session's own work runs on your session's account. Whether any browser tool (such as `find`) makes its own model requests as the pinned account hasn't been measured.
+- **Names.** `claude-in-chrome` is reserved by Claude Code, so the server is called `chrome` (`CSWAP_CHROME_NAME` changes it). If a different server already uses the name, `setup` stops instead of touching it, and `undo` only removes the server it created.
+- **Several configuration folders.** The server is registered in the Claude Code configuration you run `setup` from; run it once per `CLAUDE_CONFIG_DIR` you use.
+- **Not a documented interface.** `--claude-in-chrome-mcp` isn't one of Claude Code's documented options, so an update can change it. `cswap chrome test` shows whether it still works.
 
 ### Interactive dashboard (TUI)
 
