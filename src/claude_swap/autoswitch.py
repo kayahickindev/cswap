@@ -197,6 +197,29 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# Burn margin for the near-100 drain boundary. The usage endpoint serializes
+# each resets_at as "now + remaining", so one window comes back a few
+# microseconds different on every fetch; two readings belong to the same
+# window when their resets agree within this tolerance (a rollover moves the
+# reset by hours). Exact string equality never matched live data, which left
+# the margin pinned at one point (10-18).
+BURN_RESET_TOLERANCE_S = 300.0
+# Claude Code picks a switched credential up from the macOS Keychain cache
+# about this long after the swap.
+BURN_PICKUP_TAIL_S = 30.0
+# Team seats spend a 5h window at ~3 points a minute and a reading can be
+# several minutes old after a 429, so ten points was not enough. Handing off
+# early costs a little quota; crossing 100% stops every running session.
+# Capped at the escalation band so a hand-off always decides on freshly
+# fetched candidates.
+BURN_MARGIN_MAX_PCT = int(poll_policy.ESCALATION_MARGIN_PCT)
+
+
+def _same_window(prior_reset: float | None, reset: float | None) -> bool:
+    if prior_reset is None or reset is None:
+        return prior_reset is None and reset is None
+    return abs(prior_reset - reset) <= BURN_RESET_TOLERANCE_S
+
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
@@ -835,10 +858,12 @@ class AutoSwitchEngine:
         # conservatively at a one-point margin instead of trusting stale rate.
         self._burn_samples: dict[
             tuple[str, tuple[str, ...]],
-            tuple[dict[str, tuple[str | None, float]], float],
+            tuple[dict[str, tuple[float | None, float]], float],
         ] = {}
-        self._adaptive_margins_pct: dict[
-            tuple[str, tuple[str, ...]], int
+        # Last measured burn (points per second) per sample key. Kept apart
+        # from the margin so a reading that ages between ticks widens it.
+        self._burn_rates_pct_s: dict[
+            tuple[str, tuple[str, ...]], float
         ] = {}
         self._tier_mode: str | None = None
 
@@ -849,8 +874,10 @@ class AutoSwitchEngine:
         usage: dict | str | None,
         models: tuple[str, ...],
         ceiling: float,
+        *,
+        min_margin: int = 1,
     ) -> float:
-        """Near-100 threshold with enough room for one poll plus pickup tail."""
+        """Near-100 threshold with room for the burn until a switch lands."""
         windows = oauth.relevant_windows(
             usage if isinstance(usage, dict) else None, models
         )
@@ -859,40 +886,51 @@ class AutoSwitchEngine:
         sample_key = (current, model_key)
         if not windows or not isinstance(fetched_at, (int, float)):
             self._burn_samples.pop(sample_key, None)
-            self._adaptive_margins_pct[sample_key] = 1
-            return min(ceiling, 99.0)
+            self._burn_rates_pct_s.pop(sample_key, None)
+            return min(ceiling, 100.0 - min_margin)
 
         window_values = {
-            label: (resets_at, pct) for label, pct, resets_at in windows
+            label: (poll_policy.parse_reset_ts(resets_at), pct)
+            for label, pct, resets_at in windows
         }
         prior = self._burn_samples.get(sample_key)
-        margin = self._adaptive_margins_pct.get(sample_key, 1)
         if prior is None:
-            margin = 1
+            self._burn_rates_pct_s.pop(sample_key, None)
         else:
             prior_windows, prior_at = prior
             elapsed = fetched_at - prior_at
             burns = []
-            for label, (resets_at, pct) in window_values.items():
+            for label, (reset_ts, pct) in window_values.items():
                 prior_window = prior_windows.get(label)
-                if prior_window is None or prior_window[0] != resets_at:
+                if prior_window is None or not _same_window(
+                    prior_window[0], reset_ts
+                ):
                     continue
                 prior_pct = prior_window[1]
                 if pct >= prior_pct:
                     burns.append(pct - prior_pct)
             if elapsed > 0 and burns:
-                # Cover the next polling interval and Claude Code's observed
-                # macOS Keychain pickup tail. Cap at ten points so a single
-                # burst cannot turn the drain phase back into ordinary 90%.
-                horizon = self.settings.interval_seconds + 30.0
-                projected = max(burns) / elapsed * horizon
-                margin = max(1, min(10, math.ceil(projected)))
+                self._burn_rates_pct_s[sample_key] = max(burns) / elapsed
             elif elapsed > 0:
                 # Every comparable window reset or was corrected downward.
-                margin = 1
+                self._burn_rates_pct_s.pop(sample_key, None)
         if prior is None or fetched_at >= prior[1]:
             self._burn_samples[sample_key] = (window_values, float(fetched_at))
-        self._adaptive_margins_pct[sample_key] = margin
+
+        margin = min_margin
+        rate = self._burn_rates_pct_s.get(sample_key)
+        if rate:
+            # Cover the reading's age (the active account is read minutes
+            # apart, longer after a 429), the next tick, and Claude Code's
+            # macOS Keychain pickup tail, all at the measured burn rate.
+            horizon = (
+                max(0.0, self.clock() - fetched_at)
+                + self.settings.interval_seconds
+                + BURN_PICKUP_TAIL_S
+            )
+            margin = max(
+                min_margin, min(BURN_MARGIN_MAX_PCT, math.ceil(rate * horizon))
+            )
         return min(ceiling, 100.0 - margin)
 
     def _tiered_policy(
@@ -1449,6 +1487,21 @@ class AutoSwitchEngine:
             )
         else:
             self._decision_models = self._models
+            # A fixed near-100 threshold is crossed between reads when the
+            # active account burns fast, so it gets the same burn margin as
+            # the tiered drain. With no measured burn, or a low threshold,
+            # the configured value stands.
+            settings = replace(
+                settings,
+                threshold=self._adaptive_drain_threshold(
+                    current,
+                    entries.get(current),
+                    usage.get(current),
+                    self._decision_models,
+                    settings.threshold,
+                    min_margin=0,
+                ),
+            )
         manual_hold = self._manual_override_hold(
             state, current, entries, usage
         )

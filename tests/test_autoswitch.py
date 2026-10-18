@@ -3346,6 +3346,119 @@ class TestTieredModelStrategy:
         assert poll.threshold == 99.0
 
 
+def _seat_usage(pct5: float, fable: float, fetch_index: int) -> dict:
+    """Team-seat usage as the live endpoint serializes it.
+
+    There is no 7d window, and every resets_at is "now + remaining", so the
+    same window comes back a few microseconds different on each fetch.
+    """
+    jitter = fetch_index * 0.000137
+    return {
+        "five_hour": {"pct": pct5, "resets_at": _iso_at(1_014_400.0 + jitter)},
+        "scoped": [{
+            "name": "Fable",
+            "pct": fable,
+            "resets_at": _iso_at(1_259_200.0 + jitter),
+        }],
+    }
+
+
+class TestBurnMarginOnLiveResets:
+    """10-18: every window stopped when hello@ (a Team seat) burned its 5h
+    window at ~3 points a minute. The margin never left one point because
+    jittered resets never matched, and the plain best strategy had none."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(
+            temp_home, strategy="best", threshold=99.0, model="Fable"
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _tick(self, h: EngineHarness, reading: dict, fetched_at: float):
+        others = {
+            "2": _entry_for(_seat_usage(40, 20, 0), h.clock.now),
+            "3": _entry_for(_seat_usage(10, 12, 0), h.clock.now),
+        }
+        active = UsageEntry(
+            last_good=reading,
+            fetched_at=fetched_at,
+            age_s=h.clock.now - fetched_at,
+        )
+        h.events.clear()
+        return h.tick_with_entries({"1": active, **others})
+
+    def _threshold(self, h: EngineHarness) -> float:
+        return next(e for e in h.events if isinstance(e, PollEvent)).threshold
+
+    def test_fast_burn_hands_off_before_a_stale_reading_hits_the_limit(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        first = h.clock.now
+        assert self._tick(h, _seat_usage(80, 20, 1), first) is (
+            TickOutcome.NO_ACTION
+        )
+        assert self._threshold(h) == 99.0
+
+        h.clock.advance(120)
+        second = h.clock.now
+        reading = _seat_usage(86, 21, 2)
+        assert self._tick(h, reading, second) is TickOutcome.NO_ACTION
+        assert self._threshold(h) == 95.0
+
+        # The next reads are rate-limited; the margin grows with the age of
+        # the last reading instead of trusting it.
+        h.clock.advance(60)
+        assert self._tick(h, reading, second) is TickOutcome.NO_ACTION
+        assert self._threshold(h) == 92.0
+
+        h.clock.advance(120)
+        assert self._tick(h, reading, second) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_slow_burn_keeps_the_configured_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        assert self._tick(h, _seat_usage(80, 20, 1), h.clock.now) is (
+            TickOutcome.NO_ACTION
+        )
+        h.clock.advance(300)
+        assert self._tick(h, _seat_usage(80, 20, 2), h.clock.now) is (
+            TickOutcome.NO_ACTION
+        )
+        assert self._threshold(h) == 99.0
+
+    def test_manual_pick_is_released_before_its_hard_limit(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda state: state.update({
+                "manualOverride": {"account": "1", "selectedAt": h.clock()},
+                "lastSeenActive": "1",
+            })
+        )
+        # hello@'s readings that afternoon: 74, 83, 93 about 3.5 min apart.
+        assert self._tick(h, _seat_usage(74, 26, 1), h.clock.now) is (
+            TickOutcome.NO_ACTION
+        )
+        h.clock.advance(200)
+        assert self._tick(h, _seat_usage(83, 26, 2), h.clock.now) is (
+            TickOutcome.NO_ACTION
+        )
+        h.clock.advance(210)
+        reading = _seat_usage(93, 27, 3)
+        fetched = h.clock.now
+        assert self._tick(h, reading, fetched) is TickOutcome.NO_ACTION
+        assert "manualOverride" in h.state()
+
+        h.clock.advance(60)
+        assert self._tick(h, reading, fetched) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert "manualOverride" not in h.state()
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
