@@ -3860,6 +3860,164 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "at-limit"
 
 
+_H = 3600.0
+
+
+def _seat(pct5: float, fable: float, week_h: float) -> dict:
+    """Team seat: a 5h window and a Fable weekly row, no 7d window."""
+    now = FakeClock().now
+    return {
+        "five_hour": {"pct": pct5, "resets_at": _iso_at(now + 2 * _H)},
+        "scoped": [{
+            "name": "Fable",
+            "pct": fable,
+            "resets_at": _iso_at(now + week_h * _H),
+        }],
+    }
+
+
+def _personal(pct5: float, pct7: float, fable: float, week_h: float) -> dict:
+    """Max account: 5h, 7d and a Fable row sharing the 7d reset."""
+    now = FakeClock().now
+    week = _iso_at(now + week_h * _H)
+    return {
+        "five_hour": {"pct": pct5, "resets_at": _iso_at(now + 2 * _H)},
+        "seven_day": {"pct": pct7, "resets_at": week},
+        "scoped": [{"name": "Fable", "pct": fable, "resets_at": week}],
+    }
+
+
+class TestSoonestWeeklyResetFirst:
+    """Kaya's rule (10-19): use the 5h window of whichever account's weekly
+    window resets soonest, whatever the account."""
+
+    _EMAILS = {
+        1: "appointra", 2: "mfs", 3: "gmail", 5: "ops", 6: "partnerships",
+        7: "hello", 8: "support", 9: "kaya-team",
+    }
+
+    def _fleet(self, temp_home: Path, active: int, **settings) -> EngineHarness:
+        settings = {"model": "Fable", "threshold": 99.0, **settings}
+        h = EngineHarness(temp_home, **settings)
+        for num, name in self._EMAILS.items():
+            h.seed(num, f"{name}@example.com")
+        data = h.switcher._get_sequence_data()
+        data["activeAccountNumber"] = active
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        h.make_live(f"{self._EMAILS[active]}@example.com", active)
+        return h
+
+    _PARTNERSHIPS_AT_ITS_WALL = {
+        "1": _personal(0, 0, 0, 160),
+        "2": _personal(6, 28, 4, 149),
+        "3": _personal(0, 99, 47, 83),
+        "5": _seat(0, 20, 107),
+        "6": _seat(100, 29, 45),
+        "7": _seat(0, 22, 68),
+        "8": _seat(40, 20, 74),
+        "9": _seat(10, 12, 85),
+    }
+
+    def test_best_took_the_account_whose_week_had_just_reset(self, temp_home):
+        """10-18 12:35 PM ET: partnerships hit its 5h wall and `best` moved to
+        appointra, whose week had just reset (100% room, 6.7 days out)."""
+        h = self._fleet(temp_home, 6)
+        outcome = h.tick_with_usage(self._PARTNERSHIPS_AT_ITS_WALL)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_hand_off_picks_the_seat_whose_week_ends_first(self, temp_home):
+        """The same tick under consume-first: hello, week ending in 68h."""
+        h = self._fleet(temp_home, 6, strategy="consume-first")
+        outcome = h.tick_with_usage(self._PARTNERSHIPS_AT_ITS_WALL)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 7
+
+    def test_moves_to_the_sooner_week_before_the_limit(self, temp_home):
+        """10-18 8:41 PM ET: support at 95% went to MFS (week 6 days out)
+        while partnerships, its week ending next day, sat at 0% of its 5h."""
+        h = self._fleet(temp_home, 8, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": _personal(0, 32, 6, 156),
+            "2": _personal(0, 28, 4, 145),
+            "3": _personal(0, 99, 47, 79),
+            "5": _seat(95, 21, 103),
+            "6": _seat(0, 29, 41),
+            "7": _seat(96, 31, 64),
+            "8": _seat(95, 24, 70),
+            "9": _seat(72, 12, 81),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 6
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_a_hand_off_skips_a_nearly_full_5h_window(self, temp_home):
+        """hello's week ends first but its 5h window is at 96%: landing there
+        hits 100% inside the cooldown. kaya-team is next soonest with room."""
+        h = self._fleet(temp_home, 8, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "2": _personal(0, 28, 4, 145),
+            "7": _seat(96, 31, 64),
+            "8": _seat(100, 24, 70),
+            "9": _seat(60, 12, 81),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 9
+
+    def test_with_no_5h_room_anywhere_the_most_headroom_wins(self, temp_home):
+        h = self._fleet(temp_home, 8, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "5": _seat(80, 21, 103),
+            "7": _seat(96, 31, 64),
+            "8": _seat(100, 24, 70),
+            "9": _seat(90, 12, 81),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5
+
+    def test_no_early_move_onto_a_nearly_full_5h_window(self, temp_home):
+        h = self._fleet(temp_home, 9, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "6": _seat(80, 29, 41),
+            "9": _seat(20, 12, 81),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 9
+
+    def test_weeks_ending_within_the_hour_never_trade_places(self, temp_home):
+        """Same reset hour, read with jitter: no early move either way."""
+        h = self._fleet(temp_home, 7, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "7": _seat(10, 31, 64.0),
+            "8": _seat(0, 24, 63.9),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "7": _seat(10, 31, 64.0),
+            "8": _seat(0, 24, 62.5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 8
+
+    def test_an_account_without_a_model_row_ranks_by_its_7d_reset(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, 9, strategy="consume-first")
+        no_fable = _personal(0, 40, 0, 30)
+        del no_fable["scoped"]
+        outcome = h.tick_with_usage({
+            "2": no_fable,
+            "9": _seat(20, 12, 81),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
     """A `consume-first` departure's phase-2 refetch can write
     `(leftHeadroom, leftRecoveryAt) = (None, None)`, the exact snapshot

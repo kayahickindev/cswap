@@ -161,6 +161,20 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # it needs its own unit rather than a reused one.
 RECOVERY_HYSTERESIS_S = 300.0
 
+# Consume-first moves off a healthy account only to one whose weekly window
+# resets at least this much sooner. Weekly resets land on the hour, and the
+# endpoint reports each as "now + remaining" with microsecond jitter, so two
+# accounts sharing a reset hour would otherwise trade places on every fetch
+# and bounce at the cooldown rate. A hand-off still ranks by the exact reset.
+CONSUME_RESET_MARGIN_S = 3600.0
+
+# Consume-first ranks by weekly reset only among accounts whose 5h window has
+# real room. A Team seat burns about 3 points a minute, so one landed on at 96%
+# reaches 100% inside the switch cooldown and stops every session; 25 points
+# outlasts the cooldown with margin. The weekly windows burn several times
+# slower, so they are left to the threshold.
+CONSUME_FIVE_HOUR_MAX_PCT = 75.0
+
 # Horizon past which a sooner reset stops being worth real headroom. The escape
 # above was measured on minutes-scale resets; days-scale is the opposite trade,
 # since neither account returns within the session. 4h keeps most of a 5-hour
@@ -744,10 +758,32 @@ def _model_reset_ts(
 def _consume_reset_ts(
     usage: dict | str | None, models: Sequence[str], now: float
 ) -> float | None:
-    """Perishable reset for the active policy tier."""
+    """Perishable reset for the active policy tier.
+
+    The model row's reset when the account reports one, else the 7-day reset:
+    a missing model row would otherwise read as "reset unknown" and sort a
+    personal account with a perfectly good weekly window last.
+    """
     if models:
-        return _model_reset_ts(usage, models, now)
+        model_ts = _model_reset_ts(usage, models, now)
+        if model_ts is not None:
+            return model_ts
     return _seven_day_reset_ts(usage, now)
+
+
+def _five_hour_has_room(usage: dict | str | None) -> bool:
+    """Whether the 5h window is at or under CONSUME_FIVE_HOUR_MAX_PCT.
+
+    An account with no readable 5h row counts as having room; the threshold
+    gate still guards it.
+    """
+    if isinstance(usage, dict):
+        window = usage.get("five_hour")
+        if isinstance(window, dict) and isinstance(
+            window.get("pct"), (int, float)
+        ):
+            return float(window["pct"]) <= CONSUME_FIVE_HOUR_MAX_PCT
+    return True
 
 
 def _fresh_model_headroom(
@@ -2534,13 +2570,15 @@ class AutoSwitchEngine:
                             continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
-                    # only move to accounts whose weekly window resets sooner
-                    # than the active one (above the threshold we must move, so
-                    # any healthy account qualifies and the sort picks soonest).
+                    # only move to accounts whose weekly window resets at least
+                    # CONSUME_RESET_MARGIN_S sooner than the active one (above
+                    # the threshold we must move, so any healthy account
+                    # qualifies and the sort picks soonest).
                     if trigger == "consume-first" and (
                         reset_ts is None
                         or active_reset_ts is None
-                        or reset_ts >= active_reset_ts
+                        or reset_ts > active_reset_ts - CONSUME_RESET_MARGIN_S
+                        or not _five_hour_has_room(usage.get(num))
                     ):
                         continue
                 elif active_headroom is not None:
@@ -2575,9 +2613,17 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
+                # Soonest weekly reset first among accounts whose 5h window has
+                # room (unknown resets sort last), most headroom breaks ties,
+                # then sequence order. When no 5h window has room, the most
+                # headroom wins: landing on the fullest one only moves the
+                # next hand-off into the cooldown.
+                reset_key = reset_ts if reset_ts is not None else float("inf")
+                key = (
+                    (0, reset_key, -h)
+                    if _five_hour_has_room(usage.get(num))
+                    else (1, -h, reset_key)
+                )
             else:
                 key = (-h,)
             if (
