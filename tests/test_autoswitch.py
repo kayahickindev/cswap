@@ -4007,15 +4007,101 @@ class TestSoonestWeeklyResetFirst:
     def test_an_account_without_a_model_row_ranks_by_its_7d_reset(
         self, temp_home
     ):
-        h = self._fleet(temp_home, 9, strategy="consume-first")
+        h = self._fleet(temp_home, 1, strategy="consume-first")
         no_fable = _personal(0, 40, 0, 30)
         del no_fable["scoped"]
         outcome = h.tick_with_usage({
+            "1": _personal(0, 10, 2, 160),
             "2": no_fable,
-            "9": _seat(20, 12, 81),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestNoWeeklyLimitFirst:
+    """Kaya's rule (10-19, evening): Team seats on the Startups plan report no
+    weekly limit, so their 5h windows are spent before any Max account's."""
+
+    _fleet = TestSoonestWeeklyResetFirst._fleet
+    _EMAILS = TestSoonestWeeklyResetFirst._EMAILS
+
+    def test_a_max_account_hands_back_to_a_seat_with_5h_room(self, temp_home):
+        """appointra's week ends sooner than ops's Fable week, and it is well
+        below the threshold, but ops has 5h room and no weekly limit."""
+        h = self._fleet(temp_home, 1, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": _personal(10, 30, 5, 20),
+            "5": _seat(40, 23, 82),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_a_seat_never_leaves_for_a_sooner_week_below_the_threshold(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, 7, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "3": _personal(0, 60, 20, 10),
+            "7": _seat(50, 33, 44),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 7
+
+    def test_a_max_account_keeps_working_while_every_seat_is_nearly_full(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, 2, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "2": _personal(10, 59, 16, 100),
+            "5": _seat(78, 23, 82),
+            "6": _seat(98, 43, 21),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_a_hand_off_takes_a_seat_over_a_sooner_max_week(self, temp_home):
+        """hello hits its wall: support (5h room, Fable week 2 days out) beats
+        gmail (week ending in 10h) and appointra (most headroom)."""
+        h = self._fleet(temp_home, 7, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": _personal(0, 5, 1, 150),
+            "3": _personal(0, 60, 20, 10),
+            "7": _seat(100, 33, 44),
+            "8": _seat(30, 24, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 8
+
+    def test_with_every_seat_full_the_hand_off_falls_back_to_max(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, 7, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": _personal(0, 5, 1, 150),
+            "3": _personal(0, 60, 20, 10),
+            "7": _seat(100, 33, 44),
+            "8": _seat(97, 24, 50),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_seat_that_gains_a_weekly_row_loses_its_priority(
+        self, temp_home
+    ):
+        h = self._fleet(temp_home, 1, strategy="consume-first")
+        seat_with_week = _seat(40, 23, 82)
+        seat_with_week["seven_day"] = {
+            "pct": 10,
+            "resets_at": seat_with_week["scoped"][0]["resets_at"],
+        }
+        outcome = h.tick_with_usage({
+            "1": _personal(10, 30, 5, 20),
+            "5": seat_with_week,
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
 
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:

@@ -786,6 +786,23 @@ def _five_hour_has_room(usage: dict | str | None) -> bool:
     return True
 
 
+def _no_weekly_limit(usage: dict | str | None) -> bool:
+    """Whether the account reports a 5h window and no account-wide weekly one.
+
+    Team premium seats on the Claude for Startups plan read this way (10-19:
+    ``seven_day`` null, ``limits`` holds only the session row and the Fable
+    row). Their 5h quota costs nothing against a week, so consume-first spends
+    it before any weekly account's. Read from the response rather than the
+    plan name, so the preference ends by itself if a weekly row ever appears.
+    """
+    if not isinstance(usage, dict) or isinstance(usage.get("seven_day"), dict):
+        return False
+    window = usage.get("five_hour")
+    return isinstance(window, dict) and isinstance(
+        window.get("pct"), (int, float)
+    )
+
+
 def _fresh_model_headroom(
     usage: dict | str | None,
     models: Sequence[str],
@@ -2445,6 +2462,7 @@ class AutoSwitchEngine:
             if consume_first
             else None
         )
+        active_no_weekly = consume_first and _no_weekly_limit(usage.get(current))
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -2574,13 +2592,25 @@ class AutoSwitchEngine:
                     # CONSUME_RESET_MARGIN_S sooner than the active one (above
                     # the threshold we must move, so any healthy account
                     # qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
-                        reset_ts is None
-                        or active_reset_ts is None
-                        or reset_ts > active_reset_ts - CONSUME_RESET_MARGIN_S
-                        or not _five_hour_has_room(usage.get(num))
-                    ):
-                        continue
+                    #
+                    # An account with no weekly limit outranks every weekly
+                    # one: leave a weekly account for it whenever its 5h has
+                    # room, and never leave it for weekly quota below the
+                    # threshold. Between two of a kind the reset rule stands.
+                    if trigger == "consume-first":
+                        no_weekly = _no_weekly_limit(usage.get(num))
+                        if no_weekly != active_no_weekly:
+                            if not no_weekly or not _five_hour_has_room(
+                                usage.get(num)
+                            ):
+                                continue
+                        elif (
+                            reset_ts is None
+                            or active_reset_ts is None
+                            or reset_ts > active_reset_ts - CONSUME_RESET_MARGIN_S
+                            or not _five_hour_has_room(usage.get(num))
+                        ):
+                            continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
@@ -2613,14 +2643,15 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif consume_first:
-                # Soonest weekly reset first among accounts whose 5h window has
-                # room (unknown resets sort last), most headroom breaks ties,
-                # then sequence order. When no 5h window has room, the most
-                # headroom wins: landing on the fullest one only moves the
-                # next hand-off into the cooldown.
+                # Among accounts whose 5h window has room: no weekly limit
+                # first, then soonest weekly reset (unknown resets sort last),
+                # most headroom breaks ties, then sequence order. When no 5h
+                # window has room, the most headroom wins: landing on the
+                # fullest one only moves the next hand-off into the cooldown.
                 reset_key = reset_ts if reset_ts is not None else float("inf")
+                weekly_rank = 0 if _no_weekly_limit(usage.get(num)) else 1
                 key = (
-                    (0, reset_key, -h)
+                    (0, weekly_rank, reset_key, -h)
                     if _five_hour_has_room(usage.get(num))
                     else (1, -h, reset_key)
                 )
