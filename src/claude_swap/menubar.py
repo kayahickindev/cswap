@@ -547,7 +547,7 @@ def run(switcher) -> int:
         AppKit.NSApplicationActivationPolicyAccessory
     )
 
-    from claude_swap.autoswitch import AutoSwitchEngine
+    from claude_swap.autoswitch import AutoSwitchEngine, session_hooks
     from claude_swap.settings import load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
 
@@ -671,11 +671,13 @@ def run(switcher) -> int:
             if self._engine is not None:
                 return
             try:
+                settings = load_settings(self.switcher.backup_dir)
                 engine = AutoSwitchEngine(
                     self.switcher,
-                    load_settings(self.switcher.backup_dir),
+                    settings,
                     self._on_engine_event,
                     dry_run=False,
+                    **session_hooks(settings, dry_run=False),
                 )
             except Exception as e:  # never let a bad start crash the menu bar
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)

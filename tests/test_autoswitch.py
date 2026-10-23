@@ -7966,3 +7966,29 @@ class _RecordingResumer:
 
     def after_switch(self, report):
         self.reports.append(report)
+
+
+class TestSessionHooks:
+    """Every frontend (CLI loop, menu bar, TUI) builds its engine with these."""
+
+    def test_live_loop_with_herdr_gets_both(self, monkeypatch):
+        from claude_swap import autoswitch, limit_signal
+
+        monkeypatch.setattr(autoswitch, "find_herdr", lambda: "/opt/herdr")
+        hooks = autoswitch.session_hooks(AutoSwitchSettings(), dry_run=False)
+        assert hooks["limit_hits"] is limit_signal.recent_limit_hits
+        assert hooks["resumer"].herdr == "/opt/herdr"
+
+    def test_resume_needs_a_live_loop_herdr_and_the_setting(self, monkeypatch):
+        from claude_swap import autoswitch
+
+        monkeypatch.setattr(autoswitch, "find_herdr", lambda: "/opt/herdr")
+        on = AutoSwitchSettings()
+        off = AutoSwitchSettings(resume_stalled=False)
+        assert autoswitch.session_hooks(on, dry_run=True)["resumer"] is None
+        assert autoswitch.session_hooks(on, dry_run=False, loop=False)["resumer"] is None
+        assert autoswitch.session_hooks(off, dry_run=False)["resumer"] is None
+        monkeypatch.setattr(autoswitch, "find_herdr", lambda: None)
+        hooks = autoswitch.session_hooks(on, dry_run=False)
+        assert hooks["resumer"] is None
+        assert hooks["limit_hits"] is not None

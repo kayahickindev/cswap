@@ -1,16 +1,22 @@
 # cswap
 
-A fork of [claude-swap](https://github.com/realiti4/claude-swap) by Onur Cetinkol, kept in sync with it, with three additions:
+A fork of [claude-swap](https://github.com/realiti4/claude-swap) by Onur Cetinkol, kept in sync with it. It works with any mix of Pro, Max and Team accounts. Out of the box it behaves like claude-swap with these additions on; the `consume-first` and `tiered` strategies are opt-in.
 
-- **`cswap chrome`: Chrome keeps working when your account changes.** The Claude in Chrome extension only connects to a session signed into the same claude.ai account, and Claude Code's built-in Chrome tools connect as the session's account, so a switch cuts Chrome off. `cswap chrome setup` runs Claude Code's Chrome tools as a separate MCP server with its own permanent sign-in on the extension's account. See [Keep Chrome connected](#keep-chrome-connected-when-the-account-changes).
+- **Switches when your sessions are refused, not when a lagging number says so.** The usage endpoint can read a few points short of the limit while Claude Code is already being refused. The auto-switch loop also reads the refusals Claude Code records in its own session logs and switches on the first one that belongs to the active account. See [Automatic switching](#automatic-switching).
+- **Stopped sessions pick back up.** A refused session waits for its own window to reset and never notices the switch. If you run Claude Code in [Herdr](https://herdr.dev), cswap tells every session stuck on "Usage limit reached" to continue after each switch. Without Herdr this does nothing.
+- **Spends the quota that expires first.** `--strategy consume-first` keeps you on the account whose weekly window resets soonest. Accounts with no weekly limit (Team seats on the Claude for Startups plan) go first while their 5-hour window has room; with only Pro or Max accounts it ranks by weekly reset alone.
+- **Hands off before a fast-burning account runs out.** Near the limit, the switch point drops by the measured burn rate, so the switch lands before the account is spent.
 - **Model-aware switching and manual picks that stick.** The `tiered` strategy also watches a model's own weekly limit (for example `--model Fable`), and an account you pick by hand (`cswap switch`, or a `/login` in Claude Code) is held instead of being switched away on the next tick.
+- **`cswap chrome`: Chrome keeps working when your account changes.** The Claude in Chrome extension only connects to a session signed into the same claude.ai account, and Claude Code's built-in Chrome tools connect as the session's account, so a switch cuts Chrome off. `cswap chrome setup` runs Claude Code's Chrome tools as a separate MCP server with its own permanent sign-in on the extension's account. See [Keep Chrome connected](#keep-chrome-connected-when-the-account-changes).
 - **`cswap desktop` (experimental): the Claude desktop app follows the active account.** It's covered by tests but hasn't been tried on a real desktop app yet.
 
-Install it in place of claude-swap (they share the `cswap` command):
+Install it in place of claude-swap (they share the `cswap` command), and re-run the same line to update:
 
 ```bash
 uv tool install --force "claude-swap[menubar] @ git+https://github.com/kayahickindev/cswap"
 ```
+
+Then add your accounts and turn on switching as described in [Usage](#usage): `cswap auto` in a terminal, or `cswap menubar --install-service` with *Settings → Auto-switch accounts* on.
 
 Everything else below is claude-swap's own documentation.
 

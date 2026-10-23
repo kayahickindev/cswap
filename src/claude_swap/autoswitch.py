@@ -49,14 +49,14 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.limit_signal import LimitHit
+from claude_swap.limit_signal import LimitHit, recent_limit_hits
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.resume import StalledSessionResumer
+from claude_swap.resume import StalledSessionResumer, find_herdr
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
@@ -80,6 +80,24 @@ def _read_state_file(path: Path) -> dict:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
     return raw if isinstance(raw, dict) else {}
+
+
+def session_hooks(
+    settings: AutoSwitchSettings, *, dry_run: bool, loop: bool = True
+) -> dict:
+    """The refusal reader and session resumer for an engine built by a
+    frontend (CLI loop, menu bar, TUI), so every surface switches on refused
+    sessions and resumes them alike.
+
+    Resume rounds run on a thread after a switch, so only a loop can carry
+    them; a single tick exits before the first round.
+    """
+    resumer = None
+    if settings.resume_stalled and loop and not dry_run:
+        herdr = find_herdr()
+        if herdr:
+            resumer = StalledSessionResumer(herdr)
+    return {"limit_hits": recent_limit_hits, "resumer": resumer}
 
 
 def run_manual_switch(

@@ -29,6 +29,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     binding_pct,
     pct_label,
+    session_hooks,
 )
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
@@ -44,6 +45,7 @@ _EVENT_ROLES = {
     "switch": "accent",
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
+    "limit-hit": "sev_warn",
     "all-exhausted": "sev_crit",
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
@@ -212,6 +214,7 @@ class AutoScreen(Screen):
             self._settings,
             self._emit_from_thread,
             dry_run=dry_run,
+            **session_hooks(self._settings, dry_run=dry_run),
         )
         self._engine = engine
         self.run_worker(
