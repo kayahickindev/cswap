@@ -22,9 +22,11 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    LimitHitEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
+    ResumeEvent,
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
@@ -36,6 +38,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
+from claude_swap.limit_signal import LimitHit
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
@@ -7820,3 +7823,146 @@ class TestFreshenRoutesThroughGate:
         assert verdict == "ok"
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
+
+
+class TestSessionLimitHit:
+    """10-22: hello@ read 98% from 21:01 to 21:08 ET while every session on
+    it had been refused since 21:03, so the engine switched only when the
+    reading reached 100% and nothing resumed the stopped sessions."""
+
+    RESET = 1_000_000.0 + 3 * 3600  # the active 5h window, 3h out
+
+    def _harness(self, temp_home, hits, *, resumer=None, dry_run=False):
+        h = EngineHarness(temp_home, threshold=99.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine = h._make_engine(
+            limit_hits=lambda since, now: [x for x in hits if x.at >= since],
+            resumer=resumer,
+            dry_run=dry_run,
+        )
+        return h
+
+    def _usage(self):
+        return {
+            "1": _usage(98, _iso_at(self.RESET)),
+            "2": _usage(10, _iso_at(self.RESET + 3600)),
+            "3": _usage(20, _iso_at(self.RESET + 7200)),
+        }
+
+    def _hit(self, h, *, ago=20.0, resets_at=None):
+        return LimitHit(
+            at=h.clock() - ago,
+            resets_at=self.RESET if resets_at is None else resets_at,
+            limit_type="five_hour",
+            path="session.jsonl",
+        )
+
+    def test_without_a_scanner_the_reading_decides(self, temp_home):
+        h = self._harness(temp_home, [])
+        h.engine = h._make_engine()
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_refusal_on_the_active_window_switches_at_once(self, temp_home):
+        hits: list = []
+        h = self._harness(temp_home, hits)
+        hits.append(self._hit(h))
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        limit = next(e for e in h.events if isinstance(e, LimitHitEvent))
+        assert limit.number == "1"
+        assert limit.limit_type == "five_hour"
+        assert limit.to_json()["event"] == "limit-hit"
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_refusal_bypasses_the_cooldown(self, temp_home):
+        hits: list = []
+        h = self._harness(temp_home, hits)
+        h.engine._mutate_state(
+            lambda s: s.update(lastSwitchAt=h.clock() - 120, lastSeenActive="1")
+        )
+        hits.append(self._hit(h))
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_refusal_from_another_window_is_ignored(self, temp_home):
+        hits: list = []
+        h = self._harness(temp_home, hits)
+        hits.append(self._hit(h, resets_at=self.RESET + 2 * 3600))
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_refusal_inside_the_pickup_grace_is_ignored(self, temp_home):
+        hits: list = []
+        h = self._harness(temp_home, hits)
+        h.engine._mutate_state(
+            lambda s: s.update(lastSwitchAt=h.clock() - 60, lastSeenActive="1")
+        )
+        hits.append(self._hit(h, ago=10.0))
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_refusal_whose_window_already_reset_is_ignored(self, temp_home):
+        hits: list = []
+        h = self._harness(temp_home, hits)
+        hits.append(self._hit(h, resets_at=h.clock() - 5))
+        usage = self._usage()
+        usage["1"] = _usage(98, _iso_at(h.clock() - 5))
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+
+    def test_refusal_ends_a_manual_hold(self, temp_home):
+        hits: list = []
+        h = self._harness(temp_home, hits)
+        h.engine._mutate_state(
+            lambda s: s.update(
+                manualOverride={"account": "1", "selectedAt": h.clock() - 600},
+                lastSeenActive="1",
+            )
+        )
+        hits.append(self._hit(h))
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert "manualOverride" not in h.state()
+
+    def test_switch_starts_resume_rounds(self, temp_home):
+        resumer = _RecordingResumer()
+        hits: list = []
+        h = self._harness(temp_home, hits, resumer=resumer)
+        hits.append(self._hit(h))
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert len(resumer.reports) == 1
+        resumer.reports[0](1, [{"pane": "w1:p1", "name": "ci-mother"}])
+        resumer.reports[0](2, [])
+        resumed = [e for e in h.events if isinstance(e, ResumeEvent)]
+        assert [(e.round, e.sessions) for e in resumed] == [
+            (1, [{"pane": "w1:p1", "name": "ci-mother"}])
+        ]
+
+    def test_dry_run_never_resumes(self, temp_home):
+        resumer = _RecordingResumer()
+        hits: list = []
+        h = self._harness(temp_home, hits, resumer=resumer, dry_run=True)
+        hits.append(self._hit(h))
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert resumer.reports == []
+
+    def test_a_login_changed_elsewhere_starts_resume_rounds(self, temp_home):
+        resumer = _RecordingResumer()
+        h = self._harness(temp_home, [], resumer=resumer)
+        h.engine._mutate_state(lambda s: s.update(lastSeenActive="2"))
+        h.tick_with_usage(self._usage())
+        assert len(resumer.reports) == 1
+        h.tick_with_usage(self._usage())
+        assert len(resumer.reports) == 1
+
+
+class _RecordingResumer:
+    def __init__(self):
+        self.reports: list = []
+
+    def after_switch(self, report):
+        self.reports.append(report)

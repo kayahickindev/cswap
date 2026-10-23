@@ -49,12 +49,14 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
+from claude_swap.limit_signal import LimitHit
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap.resume import StalledSessionResumer
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
@@ -228,6 +230,11 @@ BURN_PICKUP_TAIL_S = 30.0
 # fetched candidates.
 BURN_MARGIN_MAX_PCT = int(poll_policy.ESCALATION_MARGIN_PCT)
 
+# A refusal recorded this soon after the login changed may still come from
+# the previous login: Claude Code keeps it until its Keychain cache expires
+# (BURN_PICKUP_TAIL_S), and a request already in flight lands later still.
+LIMIT_HIT_SWITCH_GRACE_S = 90.0
+
 
 def _same_window(prior_reset: float | None, reset: float | None) -> bool:
     if prior_reset is None or reset is None:
@@ -342,6 +349,14 @@ def _recovery_is_useful(
 def _now_iso() -> str:
     return (
         datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _iso_from_ts(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
@@ -558,6 +573,46 @@ class ErrorEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"error: {self.message}" + (" (will retry)" if self.transient else "")
+
+
+@dataclass(frozen=True)
+class LimitHitEvent(AutoSwitchEvent):
+    """A Claude Code session was refused on the active account's limit,
+    whatever the usage endpoint still reports."""
+
+    kind: ClassVar[str] = "limit-hit"
+    number: str
+    at: str
+    limit_type: str | None = None
+    resets_at: str | None = None
+
+    def _fields(self) -> dict:
+        return {
+            "number": self.number,
+            "at": self.at,
+            "limitType": self.limit_type,
+            "resetsAt": self.resets_at,
+        }
+
+    def human(self) -> str:
+        kind = f"{self.limit_type} " if self.limit_type else ""
+        return f"Account-{self.number}: a session hit its {kind}limit at {self.at}"
+
+
+@dataclass(frozen=True)
+class ResumeEvent(AutoSwitchEvent):
+    """Sessions stopped on a usage limit were prompted to continue."""
+
+    kind: ClassVar[str] = "resume"
+    round: int
+    sessions: list[dict] = field(default_factory=list)
+
+    def _fields(self) -> dict:
+        return {"round": self.round, "sessions": self.sessions}
+
+    def human(self) -> str:
+        names = ", ".join(s.get("name") or s.get("pane", "?") for s in self.sessions)
+        return f"resumed {len(self.sessions)} stopped session(s): {names}"
 
 
 @dataclass(frozen=True)
@@ -857,9 +912,19 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        limit_hits: Callable[[float, float], list[LimitHit]] | None = None,
+        resumer: StalledSessionResumer | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # Refusals Claude Code sessions recorded since a given time
+        # (``limit_signal.recent_limit_hits``); None reads none.
+        self._limit_hits = limit_hits
+        # Prompts sessions stopped on a limit after each switch; None leaves
+        # them to the user.
+        self._resumer = resumer
+        # Events also arrive from the resume thread.
+        self._emit_lock = threading.Lock()
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -1164,9 +1229,15 @@ class AutoSwitchEngine:
                 }
 
         state = self._read_state()
-        if state.get("lastSeenActive") == current:
+        seen = state.get("lastSeenActive")
+        if seen == current:
             return state
-        return self._mutate_state(record)
+        state = self._mutate_state(record)
+        if seen is not None:
+            # Whoever changed the login, sessions stopped on the old one's
+            # limit can now run.
+            self._resume_stalled_sessions()
+        return state
 
     def _manual_override_hold(
         self,
@@ -1287,6 +1358,61 @@ class AutoSwitchEngine:
             self._mutate_state(record_cycle)
 
         return threshold, decision_headroom
+
+    def _session_limit_hit(
+        self, state: dict, current: str, value: dict | str | None
+    ) -> LimitHit | None:
+        """The latest refusal that belongs to the live login, if any.
+
+        Only refusals recorded after the login last changed (plus the pickup
+        grace) count, and only when the refusing window resets with one of
+        the active account's windows, so a late refusal from the account we
+        just left can never move the new one.
+        """
+        if self._limit_hits is None or not isinstance(value, dict):
+            return None
+        now = self.clock()
+        since = 0.0
+        marker = state.get("manualOverride")
+        for changed_at in (
+            state.get("lastSwitchAt"),
+            marker.get("selectedAt") if isinstance(marker, dict) else None,
+        ):
+            if isinstance(changed_at, (int, float)):
+                since = max(since, changed_at + LIMIT_HIT_SWITCH_GRACE_S)
+        if since >= now:
+            return None
+        resets = [
+            reset
+            for _, _, resets_at in oauth.relevant_windows(value, ("all",))
+            if (reset := poll_policy.parse_reset_ts(resets_at)) is not None
+        ]
+        try:
+            hits = self._limit_hits(since, now)
+        except Exception as e:  # a transcript read must never break a tick
+            _logger.debug("limit-hit scan failed: %r", e)
+            return None
+        for hit in sorted(hits, key=lambda h: h.at, reverse=True):
+            if hit.resets_at is None:
+                return hit
+            if hit.resets_at <= now:
+                continue  # that window has already reset
+            if any(
+                abs(hit.resets_at - reset) <= BURN_RESET_TOLERANCE_S
+                for reset in resets
+            ):
+                return hit
+        return None
+
+    def _resume_stalled_sessions(self) -> None:
+        if self._resumer is None or self.dry_run:
+            return
+
+        def report(round_number: int, sessions: list[dict]) -> None:
+            if sessions:
+                self._emit(ResumeEvent(round=round_number, sessions=sessions))
+
+        self._resumer.after_switch(report)
 
     # -- quarantine -----------------------------------------------------------
 
@@ -1555,9 +1681,19 @@ class AutoSwitchEngine:
                     min_margin=0,
                 ),
             )
-        manual_hold = self._manual_override_hold(
-            state, current, entries, usage
-        )
+        limit_hit = self._session_limit_hit(state, current, usage.get(current))
+        if limit_hit is not None:
+            # Sessions are already being refused: the account is out whatever
+            # the lagging reading says, and a manual pick has nothing left to
+            # hold.
+            headroom = {**headroom, current: 0.0}
+            if isinstance(state.get("manualOverride"), dict) and not self.dry_run:
+                self._clear_manual_override()
+            manual_hold = None
+        else:
+            manual_hold = self._manual_override_hold(
+                state, current, entries, usage
+            )
         if manual_hold is not None:
             manual_threshold, headroom = manual_hold
             if manual_threshold is not None:
@@ -1581,6 +1717,20 @@ class AutoSwitchEngine:
                 },
             )
         )
+
+        if limit_hit is not None:
+            self._emit(
+                LimitHitEvent(
+                    number=current,
+                    at=_iso_from_ts(limit_hit.at),
+                    limit_type=limit_hit.limit_type,
+                    resets_at=(
+                        _iso_from_ts(limit_hit.resets_at)
+                        if limit_hit.resets_at is not None
+                        else None
+                    ),
+                )
+            )
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -2930,6 +3080,7 @@ class AutoSwitchEngine:
                 warnings=result.get("warnings", []),
             )
         )
+        self._resume_stalled_sessions()
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
@@ -3023,7 +3174,8 @@ class AutoSwitchEngine:
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
-        self.on_event(event)
+        with self._emit_lock:
+            self.on_event(event)
 
     # -- loop -------------------------------------------------------------------
 

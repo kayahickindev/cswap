@@ -1059,11 +1059,14 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, limit_hits=None,
+                     resumer=None):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.limit_hits = limit_hits
+            self.resumer = resumer
             type(self).instances.append(self)
 
         def tick(self):

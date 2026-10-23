@@ -873,7 +873,9 @@ Defaults live in settings.json in the backup root; flags override them.
     args = parser.parse_args(argv)
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.limit_signal import recent_limit_hits
     from claude_swap.printer import accent, yellowed
+    from claude_swap.resume import StalledSessionResumer, find_herdr
     from claude_swap.settings import load_settings, merged_with_cli
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
@@ -884,7 +886,7 @@ Defaults live in settings.json in the backup root; flags override them.
         line = event.human()
         if event.kind == "switch":
             line = accent(line)
-        elif event.kind in ("error", "account-quarantined"):
+        elif event.kind in ("error", "account-quarantined", "limit-hit"):
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
@@ -898,11 +900,20 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        # Resume rounds run on a thread after a switch, so only the loop can
+        # carry them; a --once tick exits before the first round.
+        resumer = None
+        if settings.resume_stalled and not args.once and not args.dry_run:
+            herdr = find_herdr()
+            if herdr:
+                resumer = StalledSessionResumer(herdr)
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            limit_hits=recent_limit_hits,
+            resumer=resumer,
         )
 
         if args.once:

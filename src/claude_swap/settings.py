@@ -61,6 +61,9 @@ class AutoSwitchSettings:
     # this utilization. ``threshold`` remains the near-100 drain ceiling once
     # no fresh model account remains.
     model_threshold: float = 90.0
+    # After a switch, prompt Herdr-hosted Claude Code sessions that stopped on
+    # a usage limit to continue on the new login.
+    resume_stalled: bool = True
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "modelThreshold", "model_threshold", "float", 50.0, 99.9,
             help="Tiered-mode model rotation threshold in pct",
+        ),
+        SettingSpec(
+            "autoswitch", "resumeStalled", "resume_stalled", "bool",
+            help="After a switch, tell Herdr sessions stopped on a usage limit to continue",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
