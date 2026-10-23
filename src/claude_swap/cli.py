@@ -419,6 +419,140 @@ Then:
         sys.exit(130)
 
 
+def _codex_command(argv: list[str]) -> None:
+    """Handle `cswap codex [list|add|switch|remove|auto]`."""
+    parser = argparse.ArgumentParser(
+        prog="cswap codex",
+        description=(
+            "Rotate the Codex CLI between ChatGPT logins. Each login lives in its own "
+            "folder and ~/.codex/auth.json points at the active one. A switch reaches "
+            "new Codex sessions; running ones keep their login until restarted."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap codex add --adopt         # store the login Codex uses now
+  cswap codex add                 # log in another account (opens the browser)
+  cswap codex list                # every login with its 5h / weekly usage
+  cswap codex switch 2            # new Codex sessions use account 2
+  cswap codex auto                # switch before the live login runs out
+  cswap codex auto --install-service   # same, started at login by launchd
+
+Log in with `cswap codex add`, not `codex login`: a plain `codex login` writes
+over whichever stored login is active.
+        """,
+    )
+    parser.add_argument(
+        "action", nargs="?", default="list",
+        choices=("list", "add", "switch", "remove", "auto"),
+    )
+    parser.add_argument("target", nargs="?", help="switch/remove: account number or email")
+    parser.add_argument("--json", action="store_true", help="list/auto: JSON output")
+    parser.add_argument("--cached", action="store_true", help="list: last stored readings, no fetch")
+    parser.add_argument("--adopt", action="store_true", help="add: store the login Codex is using now")
+    parser.add_argument("--once", action="store_true", help="auto: one check, then exit")
+    parser.add_argument("--dry-run", action="store_true", help="auto: report, never switch")
+    parser.add_argument("--threshold", type=float, default=90.0, help="auto: switch at this pct (default 90)")
+    parser.add_argument("--interval", type=float, default=60.0, help="auto: seconds between checks (default 60)")
+    parser.add_argument("--install-service", action="store_true", help="auto: run it under launchd at login")
+    parser.add_argument("--uninstall-service", action="store_true", help="auto: remove the launchd service")
+    args = parser.parse_args(argv)
+
+    import signal
+    import time as _time
+
+    from claude_swap.codex import (
+        CodexAutoEngine,
+        CodexAutoSettings,
+        CodexError,
+        CodexStore,
+        auto_service_label,
+        describe_usage,
+    )
+    from claude_swap.paths import get_backup_root
+
+    store = CodexStore(get_backup_root())
+    try:
+        if args.action == "list":
+            if not args.cached and store.accounts():
+                store.refresh_usage()
+            accounts = store.accounts()
+            if args.json:
+                print(json.dumps({
+                    "schemaVersion": 1,
+                    "liveAuth": str(store.live_auth),
+                    "activeNumber": int(store.active_number()) if store.active_number() else None,
+                    "accounts": [a.to_json() for a in accounts],
+                }))
+                return
+            if not accounts:
+                print("No Codex accounts yet. Store the current login with: cswap codex add --adopt")
+                return
+            print("Codex accounts:")
+            for a in accounts:
+                plan = f" [{a.plan}]" if a.plan else ""
+                active = " (active)" if a.active else ""
+                print(f"  {a.number}: {a.email}{plan}{active}")
+                print(f"     └ {describe_usage(a.usage)}")
+            if store.active_number() is None:
+                print(muted("\nThe live Codex login is not one of these. Run: cswap codex add --adopt"))
+        elif args.action == "add":
+            account = store.adopt_live() if args.adopt else store.add_login()
+            plan = f" [{account.plan}]" if account.plan else ""
+            print(f"Stored Codex account {account.number}: {account.email}{plan}"
+                  + (" (active)" if account.active else ""))
+        elif args.action == "switch":
+            if not args.target:
+                parser.error("switch needs an account number or email")
+            before, after = store.switch(args.target)
+            if before is not None and before.number == after.number:
+                print(f"Codex account {after.number} ({after.email}) is already active")
+            else:
+                print(f"New Codex sessions now use account {after.number} ({after.email}). "
+                      "Restart running sessions to move them (codex resume --last).")
+        elif args.action == "remove":
+            if not args.target:
+                parser.error("remove needs an account number or email")
+            account = store.remove(args.target)
+            print(f"Removed Codex account {account.number} ({account.email})")
+        elif args.action == "auto":
+            if args.install_service or args.uninstall_service:
+                from claude_swap import launch_agent
+
+                label = auto_service_label()
+                if args.uninstall_service:
+                    result = launch_agent.uninstall(label=label)
+                    print(f"Removed {label}" if result["was_loaded"] or result["removed_plist"]
+                          else f"{label} was not installed")
+                else:
+                    result = launch_agent.install(label=label, arguments=("codex", "auto", "--json"))
+                    print(f"Codex auto-switch runs under launchd as {label}; log: {result['stdout_log']}")
+                return
+            settings = CodexAutoSettings(threshold=args.threshold, interval_seconds=args.interval)
+
+            def emit(event: dict) -> None:
+                if args.json:
+                    print(json.dumps(event), flush=True)
+                    return
+                if event["event"] in ("poll",):
+                    return
+                detail = " ".join(f"{k}={v}" for k, v in event.items()
+                                  if k not in ("schemaVersion", "event", "ts"))
+                print(f"{_time.strftime('%H:%M:%S')}  {event['event']}: {detail}", flush=True)
+
+            engine = CodexAutoEngine(store, settings, emit, dry_run=args.dry_run)
+            if args.once:
+                outcome = engine.tick()
+                sys.exit({"switched": 0, "no-action": 2, "blocked": 3}.get(outcome, 1))
+            signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+            sys.exit(engine.run_loop())
+    except CodexError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
 def _chrome_command(argv: list[str]) -> None:
     """Handle `cswap chrome [status|setup|test|undo]`.
 
@@ -1196,6 +1330,9 @@ def main() -> None:
         return
     if argv and argv[0] == "desktop":
         _desktop_command(argv[1:])
+        return
+    if argv and argv[0] == "codex":
+        _codex_command(argv[1:])
         return
     if argv and argv[0] == "chrome":
         _chrome_command(argv[1:])

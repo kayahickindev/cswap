@@ -123,6 +123,7 @@ def build_plist(
     program: list[str] | None = None,
     label: str = LABEL,
     home: Path | None = None,
+    arguments: tuple[str, ...] = ("menubar",),
 ) -> bytes:
     """Serialize the LaunchAgent plist.
 
@@ -134,7 +135,7 @@ def build_plist(
     return plistlib.dumps(
         {
             "Label": label,
-            "ProgramArguments": [*program, "menubar"],
+            "ProgramArguments": [*program, *arguments],
             "RunAtLoad": True,
             # Restart a crash, but respect a deliberate Quit. The menu bar's
             # quit handler calls rumps.quit_application(), a clean exit(0);
@@ -219,6 +220,7 @@ def install(
     home: Path | None = None,
     program: list[str] | None = None,
     uid: int | None = None,
+    arguments: tuple[str, ...] = ("menubar",),
 ) -> dict:
     """Write the plist and hand the service to launchd.
 
@@ -233,7 +235,7 @@ def install(
 
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
-    target_plist.write_bytes(build_plist(program, label, home))
+    target_plist.write_bytes(build_plist(program, label, home, arguments))
 
     settled = True
     if is_loaded(label, uid):
@@ -253,7 +255,7 @@ def install(
     return {
         "label": label,
         "plist": str(target_plist),
-        "program": [*program, "menubar"],
+        "program": [*program, *arguments],
         "stdout_log": str(out_log),
         "stderr_log": str(err_log),
     }
