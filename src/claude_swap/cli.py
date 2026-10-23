@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+from pathlib import Path
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
@@ -437,6 +438,8 @@ Examples:
   cswap codex switch 2            # new Codex sessions use account 2
   cswap codex auto                # switch before the live login runs out
   cswap codex auto --install-service   # same, started at login by launchd
+  cswap codex home ~/.codex-daybreak   # rotate that home; ~/.codex keeps its login
+  cswap codex sync --agent sec-scanner # move a Codex agent to the active login now
 
 Log in with `cswap codex add`, not `codex login`: a plain `codex login` writes
 over whichever stored login is active.
@@ -444,9 +447,10 @@ over whichever stored login is active.
     )
     parser.add_argument(
         "action", nargs="?", default="list",
-        choices=("list", "add", "switch", "remove", "auto"),
+        choices=("list", "add", "switch", "remove", "auto", "home", "sync"),
     )
-    parser.add_argument("target", nargs="?", help="switch/remove: account number or email")
+    parser.add_argument("target", nargs="?", help="switch/remove: account number or email; home: path")
+    parser.add_argument("--agent", help="sync: only this Herdr agent (name or pane id)")
     parser.add_argument("--json", action="store_true", help="list/auto: JSON output")
     parser.add_argument("--cached", action="store_true", help="list: last stored readings, no fetch")
     parser.add_argument("--adopt", action="store_true", help="add: store the login Codex is using now")
@@ -515,6 +519,32 @@ over whichever stored login is active.
                 parser.error("remove needs an account number or email")
             account = store.remove(args.target)
             print(f"Removed Codex account {account.number} ({account.email})")
+        elif args.action == "home":
+            if args.target:
+                account = store.set_live_home(Path(args.target))
+                print(f"Rotating Codex home: {store.live_home}"
+                      + (f" (account {account.number}, {account.email})" if account else ""))
+            else:
+                print(f"Rotating Codex home: {store.live_home}")
+            for number, homes in sorted(store.pins().items()):
+                print(f"  {', '.join(homes)} keeps account {number}")
+        elif args.action == "sync":
+            from claude_swap.codex_panes import CodexPaneSync
+            from claude_swap.resume import find_herdr
+
+            herdr = find_herdr()
+            if not herdr:
+                print("Herdr is not installed; nothing to sync")
+                return
+            results = CodexPaneSync(store, herdr, codex=store.codex).sync(agent=args.agent, min_idle_s=0)
+            if args.json:
+                print(json.dumps({"restarted": results}))
+            elif not results:
+                print("Every Codex agent is on the active login")
+            for r in results:
+                label = r.get("name") or r["pane"]
+                print(f"{label}: " + (r["error"] if r.get("error") else
+                      "restarted on the active login" + (" and told to continue" if r["continued"] else "")))
         elif args.action == "auto":
             if args.install_service or args.uninstall_service:
                 from claude_swap import launch_agent
@@ -540,7 +570,15 @@ over whichever stored login is active.
                                   if k not in ("schemaVersion", "event", "ts"))
                 print(f"{_time.strftime('%H:%M:%S')}  {event['event']}: {detail}", flush=True)
 
-            engine = CodexAutoEngine(store, settings, emit, dry_run=args.dry_run)
+            pane_sync = None
+            if not args.dry_run:
+                from claude_swap.codex_panes import CodexPaneSync
+                from claude_swap.resume import find_herdr
+
+                herdr = find_herdr()
+                if herdr:
+                    pane_sync = CodexPaneSync(store, herdr, codex=store.codex)
+            engine = CodexAutoEngine(store, settings, emit, dry_run=args.dry_run, pane_sync=pane_sync)
             if args.once:
                 outcome = engine.tick()
                 sys.exit({"switched": 0, "no-action": 2, "blocked": 3}.get(outcome, 1))

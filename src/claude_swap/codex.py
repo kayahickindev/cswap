@@ -19,6 +19,11 @@ Usage comes from Codex itself: ``codex app-server`` run against an account's
 folder answers ``account/rateLimits/read`` for that login without making it
 the live one.
 
+One Codex home rotates (``cswap codex home``, ``~/.codex`` by default). Any
+other home left linked to a slot is pinned to that login: it keeps it, and the
+rotation never takes that login. With the Daybreak home rotating between the
+workspace seats, plain ``codex`` stays on Pro.
+
 Run ``codex login`` only through ``cswap codex add``: a plain ``codex login``
 writes through the symlink and replaces the active account's login.
 """
@@ -334,6 +339,8 @@ class CodexAccount:
     added: str
     usage: CodexUsage | None = None
     active: bool = False
+    # Other Codex homes that keep this login; the rotation leaves it alone.
+    pinned_to: tuple[str, ...] = ()
 
     @property
     def key(self) -> tuple[str, str]:
@@ -346,6 +353,7 @@ class CodexAccount:
             "plan": self.plan,
             "accountId": self.account_id,
             "active": self.active,
+            "pinnedTo": list(self.pinned_to),
             "usage": self.usage.to_json() if self.usage else None,
         }
 
@@ -369,13 +377,21 @@ class CodexStore:
         self.slots = self.root / "slots"
         self.index_path = self.root / "accounts.json"
         self.usage_path = self.root / "usage.json"
-        self.live_home = live_home or live_codex_home()
+        self._explicit_home = Path(live_home) if live_home is not None else None
         self._codex = codex
         self._usage_reader = usage_reader
         self._login_runner = login_runner
         self._lock = FileLock(self.root / ".lock")
 
     # -- paths -------------------------------------------------------------
+
+    @property
+    def live_home(self) -> Path:
+        """The Codex home that rotates: as configured, else CODEX_HOME or ~/.codex."""
+        if self._explicit_home is not None:
+            return self._explicit_home
+        configured = self._read_index().get("liveHome")
+        return Path(configured).expanduser() if configured else live_codex_home()
 
     @property
     def live_auth(self) -> Path:
@@ -415,6 +431,7 @@ class CodexStore:
         data = self._read_index()
         active = self.active_number()
         usage = self.cached_usage()
+        pins = self.pins()
         accounts = []
         for number, record in sorted(data["accounts"].items(), key=lambda kv: int(kv[0])):
             accounts.append(
@@ -427,6 +444,7 @@ class CodexStore:
                     added=record.get("added", ""),
                     usage=usage.get(number),
                     active=number == active,
+                    pinned_to=tuple(pins.get(number, ())),
                 )
             )
         return accounts
@@ -445,15 +463,59 @@ class CodexStore:
         raise CodexError(f"no Codex account {target!r} (see: cswap codex list)")
 
     def active_number(self) -> str | None:
-        """The slot the live auth.json points at, if it is one of ours."""
+        """The slot the rotating home's auth.json points at, if it is ours."""
+        return self._slot_of_link(self.live_auth)
+
+    def pins(self) -> dict[str, list[str]]:
+        """Slot number -> the other homes still linked to it."""
+        out: dict[str, list[str]] = {}
+        live = str(self.live_home)
+        for home in self._read_index().get("pinned", []):
+            if home == live:
+                continue
+            number = self._slot_of_link(Path(home) / AUTH_FILENAME)
+            if number is not None:
+                out.setdefault(number, []).append(home)
+        return out
+
+    def set_live_home(self, home: Path) -> CodexAccount | None:
+        """Make ``home`` the rotating Codex home.
+
+        The home that rotated until now keeps the login it points at, pinned.
+        A plain login already in ``home`` is stored as an account.
+        """
+        home = Path(home).expanduser().absolute()
+        with self._lock:
+            data = self._read_index()
+            old = self.live_home
+            pinned = set(data.get("pinned", []))
+            if old != home and self._slot_of_link(old / AUTH_FILENAME) is not None:
+                pinned.add(str(old))
+            pinned.discard(str(home))
+            data["pinned"] = sorted(pinned)
+            if str(old) != str(home):
+                # The switch history belongs to the home that rotated until now.
+                data.pop("lastSwitchAt", None)
+                data["switchLog"] = []
+            data["liveHome"] = str(home)
+            self._write_index(data)
+            if self._explicit_home is not None:
+                self._explicit_home = home
+        live = home / AUTH_FILENAME
+        if live.exists() and not live.is_symlink():
+            return self.adopt_live()
+        number = self.active_number()
+        return self.resolve(number) if number else None
+
+    def _slot_of_link(self, auth: Path) -> str | None:
         try:
-            if not self.live_auth.is_symlink():
+            if not auth.is_symlink():
                 return None
-            target = Path(os.readlink(self.live_auth))
+            target = Path(os.readlink(auth))
         except OSError:
             return None
         if not target.is_absolute():
-            target = self.live_auth.parent / target
+            target = auth.parent / target
         try:
             relative = target.resolve().relative_to(self.slots.resolve())
         except (OSError, ValueError):
@@ -581,6 +643,11 @@ class CodexStore:
             # live path stops pointing at it.
             self.adopt_live()
         account = self.resolve(target)
+        if account.pinned_to:
+            raise CodexError(
+                f"Codex account {account.number} is pinned to {', '.join(account.pinned_to)}; "
+                "use that home for it"
+            )
         with self._lock:
             if not self.slot_auth(account.number).exists():
                 raise CodexError(
@@ -592,9 +659,12 @@ class CodexStore:
                 return account, account
             self._point_live_at(account.number)
             data = self._read_index()
-            data["lastSwitchAt"] = time.time()
+            now = time.time()
+            data["lastSwitchAt"] = now
             data["lastSwitchFrom"] = previous
             data["lastSwitchTo"] = account.number
+            log = data.get("switchLog") if isinstance(data.get("switchLog"), list) else []
+            data["switchLog"] = (log + [{"at": now, "from": previous, "to": account.number}])[-100:]
             self._write_index(data)
         before = None
         if previous is not None:
@@ -617,6 +687,8 @@ class CodexStore:
         with self._lock:
             if account.number == self.active_number():
                 raise CodexError("that is the active Codex login; switch to another one first")
+            if account.pinned_to:
+                raise CodexError(f"that login is pinned to {', '.join(account.pinned_to)}")
             data = self._read_index()
             data["accounts"].pop(account.number, None)
             self._write_index(data)
@@ -731,10 +803,22 @@ class CodexAutoEngine:
     emit: Callable[[dict], None]
     dry_run: bool = False
     clock: Callable[[], float] = time.time
+    # Restarts Codex panes still on an older login (codex_panes.CodexPaneSync).
+    pane_sync: object | None = None
     _last_full_read: float = field(default=0.0, init=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
 
     def tick(self) -> str:
+        outcome = self._decide()
+        if self.pane_sync is not None and not self.dry_run:
+            try:
+                for result in self.pane_sync.sync():
+                    self._event("restart", **result)
+            except Exception as e:  # a pane restart must never stop the switcher
+                self._event("error", message=f"pane sync: {type(e).__name__}: {e}", transient=True)
+        return outcome
+
+    def _decide(self) -> str:
         now = self.clock()
         for note in self.store.check_slots():
             self._event("warning", message=note)
@@ -786,7 +870,7 @@ class CodexAutoEngine:
             accounts = self.store.accounts()
         candidates = [
             a for a in accounts
-            if not a.active and a.usage is not None
+            if not a.active and not a.pinned_to and a.usage is not None
             and a.usage.binding_pct is not None
             and a.usage.binding_pct < self.settings.threshold
         ]

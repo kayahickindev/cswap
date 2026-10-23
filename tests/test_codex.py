@@ -324,3 +324,56 @@ def test_launch_agent_runs_any_subcommand(tmp_path):
     assert plistlib.loads(launch_agent.build_plist(["/x/cswap"], home=tmp_path))[
         "ProgramArguments"
     ] == ["/x/cswap", "menubar"]
+
+
+class TestRotatingHome:
+    def _two_homes(self, h, tmp_path):
+        h.write_live(PRO)
+        h.store.adopt_live()  # ~/.codex analogue keeps Pro
+        daybreak = tmp_path / "codex-daybreak"
+        daybreak.mkdir()
+        (daybreak / "auth.json").write_text(_auth(*SEAT_OPS, refresh="rt-db"))
+        return daybreak
+
+    def test_moving_the_rotation_pins_the_old_home(self, h, tmp_path):
+        daybreak = self._two_homes(h, tmp_path)
+        account = h.store.set_live_home(daybreak)
+        assert (account.number, account.email) == ("2", "ops@example.com")
+        assert (daybreak / "auth.json").is_symlink()
+        assert h.store.live_home == daybreak
+        pro = h.store.resolve("1")
+        assert pro.pinned_to == (str(h.live),)
+        assert not pro.active
+        # The old home still runs Pro through its own link.
+        assert read_identity(h.live / "auth.json").email == "kaya@example.com"
+
+    def test_a_pinned_login_is_never_rotated_in_or_removed(self, h, tmp_path):
+        daybreak = self._two_homes(h, tmp_path)
+        h.store.set_live_home(daybreak)
+        with pytest.raises(CodexError):
+            h.store.switch("1")
+        with pytest.raises(CodexError):
+            h.store.remove("1")
+        h.logins.append(SEAT_HELLO)
+        h.store.add_login()
+        h.readings.update({
+            "ops@example.com": _usage(95, 10),
+            "kaya@example.com": _usage(None, 1),
+            "hello@example.com": _usage(10, 10),
+        })
+        events: list[dict] = []
+        engine = CodexAutoEngine(h.store, CodexAutoSettings(threshold=90), events.append)
+        assert engine.tick() == "switched"
+        assert h.store.active_number() == "3"
+
+    def test_switches_are_logged_and_the_log_resets_with_the_home(self, h, tmp_path):
+        h.write_live(PRO)
+        h.logins.append(SEAT_OPS)
+        h.store.add_login()
+        h.store.switch("2")
+        log = h.store._read_index()["switchLog"]
+        assert [(e["from"], e["to"]) for e in log] == [("1", "2")]
+        daybreak = tmp_path / "db"
+        daybreak.mkdir()
+        h.store.set_live_home(daybreak)
+        assert h.store._read_index()["switchLog"] == []
