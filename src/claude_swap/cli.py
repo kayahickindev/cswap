@@ -457,6 +457,7 @@ over whichever stored login is active.
     parser.add_argument("--once", action="store_true", help="auto: one check, then exit")
     parser.add_argument("--dry-run", action="store_true", help="auto: report, never switch")
     parser.add_argument("--threshold", type=float, default=90.0, help="auto: switch at this pct (default 90)")
+    parser.add_argument("--decide-on", choices=("five_hour", "binding"), default="five_hour", help="auto: which window drives the switch (default five_hour)")
     parser.add_argument("--interval", type=float, default=60.0, help="auto: seconds between checks (default 60)")
     parser.add_argument("--install-service", action="store_true", help="auto: run it under launchd at login")
     parser.add_argument("--uninstall-service", action="store_true", help="auto: remove the launchd service")
@@ -558,7 +559,7 @@ over whichever stored login is active.
                     result = launch_agent.install(label=label, arguments=("codex", "auto", "--json"))
                     print(f"Codex auto-switch runs under launchd as {label}; log: {result['stdout_log']}")
                 return
-            settings = CodexAutoSettings(threshold=args.threshold, interval_seconds=args.interval)
+            settings = CodexAutoSettings(threshold=args.threshold, interval_seconds=args.interval, decide_on=args.decide_on)
 
             def emit(event: dict) -> None:
                 if args.json:

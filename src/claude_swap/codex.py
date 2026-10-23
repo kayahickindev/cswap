@@ -183,6 +183,54 @@ class CodexUsage:
         resets = [w.resets_at for w in self.windows if w.label == "7d" and w.resets_at]
         return min(resets) if resets else None
 
+    @property
+    def five_hour_pct(self) -> float | None:
+        """The account-wide 5-hour window's utilization, the renewable axis
+        the Daybreak rotation drains. None when the seat reports no 5h window
+        (a Pro login reports only a weekly window)."""
+        if self.error is not None:
+            return None
+        for window in self.windows:
+            if window.label == "5h":
+                return window.pct
+        return None
+
+    @property
+    def five_hour_reset(self) -> float | None:
+        for window in self.windows:
+            if window.label == "5h" and window.resets_at:
+                return window.resets_at
+        return None
+
+    @property
+    def weekly_pct(self) -> float | None:
+        pcts = [w.pct for w in self.windows if w.label == "7d"]
+        return max(pcts) if pcts else None
+
+    @property
+    def weekly_blocked(self) -> bool:
+        """No real room left this week, whatever the 5-hour window says: the
+        backend refused included usage, or the weekly window is itself full.
+        Such a seat is never a rotation target even with a fresh 5h window."""
+        if self.usage_allowed is False or self.limit_reached:
+            return True
+        weekly = self.weekly_pct
+        return weekly is not None and weekly >= 100.0
+
+    def rotation_pct(self, axis: str) -> float | None:
+        """The utilization the rotation decides on. ``five_hour`` drains each
+        seat's renewable 5-hour window and treats the weekly as a hard wall;
+        ``binding`` is the old max-of-windows behavior. A weekly-blocked seat
+        always reads 100 so it is never chosen or held."""
+        if axis != "five_hour":
+            return self.binding_pct
+        if self.error is not None:
+            return None
+        if self.weekly_blocked:
+            return 100.0
+        five = self.five_hour_pct
+        return five if five is not None else self.binding_pct
+
     def to_json(self) -> dict:
         return {
             "windows": [
@@ -786,16 +834,23 @@ class CodexAutoSettings:
     # Accounts that are not live move slowly; read them this often.
     candidate_interval_seconds: float = 300.0
     cooldown_seconds: float = 300.0
+    # Which window the rotation drains: "five_hour" (default) keeps each seat
+    # on its renewable 5-hour window and treats the weekly as a hard wall, so
+    # two Daybreak seats spend both 5-hour windows fully; "binding" is the old
+    # max-of-windows behavior.
+    decide_on: str = "five_hour"
 
 
 @dataclass
 class CodexAutoEngine:
     """Keep new Codex sessions on a login with room.
 
-    The live login moves when it reaches the threshold or the backend says
-    its included usage is spent, to the account with the most room, ties to
-    the soonest weekly reset. The cooldown never holds an account that is
-    already out.
+    The live login moves when the decision window (the 5-hour window by
+    default, ``settings.decide_on``) reaches the threshold or the backend says
+    its included usage is spent, to the account with the most room on that
+    window, ties to the soonest reset. A weekly-blocked seat is never a target
+    even with a fresh 5-hour window. The cooldown never holds a seat already
+    out.
     """
 
     store: CodexStore
@@ -842,14 +897,21 @@ class CodexAutoEngine:
             self._last_full_read = now
         accounts = self.store.accounts()
         active = next(a for a in accounts if a.active)
+        axis = self.settings.decide_on
+        pct = lambda a: a.usage.rotation_pct(axis) if a.usage else None
+        rank_reset = (
+            (lambda a: a.usage.five_hour_reset) if axis == "five_hour"
+            else (lambda a: a.usage.weekly_reset)
+        )
         self._event(
             "poll",
             active=int(active.number),
             threshold=self.settings.threshold,
-            bindingPct={a.number: (a.usage.binding_pct if a.usage else None) for a in accounts},
+            axis=axis,
+            usedPct={a.number: pct(a) for a in accounts},
         )
 
-        used = active.usage.binding_pct if active.usage else None
+        used = pct(active)
         if used is None:
             self._event("no-switch", reason="active-usage-unknown",
                         detail=(active.usage.error if active.usage else "not read yet"))
@@ -871,16 +933,16 @@ class CodexAutoEngine:
         usable = [
             a for a in accounts
             if not a.active and not a.pinned_to and a.usage is not None
-            and a.usage.binding_pct is not None
+            and pct(a) is not None
         ]
-        candidates = [a for a in usable if a.usage.binding_pct < self.settings.threshold]
+        candidates = [a for a in usable if pct(a) < self.settings.threshold]
         if not candidates and exhausted:
-            # The active seat is hard out. Any peer with a sliver of room left
-            # (still under 100% and not refused by the backend) beats sitting
-            # on a dead seat, even though it is over the proactive line.
+            # The active seat is hard out. Any peer with room left on the
+            # decision window (and not walled by the weekly) beats sitting on a
+            # dead seat, even though it is over the proactive line.
             candidates = [
                 a for a in usable
-                if a.usage.binding_pct < 100.0 and a.usage.usage_allowed is not False
+                if pct(a) < 100.0 and not a.usage.weekly_blocked
             ]
         if not candidates:
             self._event("no-switch", reason="no-candidates",
@@ -888,7 +950,7 @@ class CodexAutoEngine:
             return "blocked"
         target = min(
             candidates,
-            key=lambda a: (a.usage.binding_pct, a.usage.weekly_reset or float("inf"), int(a.number)),
+            key=lambda a: (pct(a), rank_reset(a) or float("inf"), int(a.number)),
         )
         trigger = "at-limit" if exhausted else "proactive"
         if self.dry_run:

@@ -431,3 +431,77 @@ class TestAtLimitFallback:
         )
         assert engine.tick() == "blocked"
         assert h.store.active_number() == "2"
+
+
+class TestFiveHourAxis:
+    """Kaya 10-23: rotate to spend each Daybreak seat's 5-hour window, with
+    the weekly as a hard wall — not the old max(5h, weekly) decision."""
+
+    def _setup(self, h, tmp_path, active, ops, hello, **kw):
+        h.write_live(PRO)
+        h.store.adopt_live()
+        db = tmp_path / "db"; db.mkdir()
+        (db / "auth.json").write_text(_auth(*SEAT_OPS, refresh="rt-db"))
+        h.store.set_live_home(db)          # ops = slot 2, active; Pro pinned
+        h.logins.append(SEAT_HELLO)
+        h.store.add_login()                # hello = slot 3
+        h.readings.update({"ops@example.com": active, "hello@example.com": hello,
+                           "kaya@example.com": _usage(None, 43)})
+        if ops is not None:
+            h.readings["ops@example.com"] = ops
+        events: list[dict] = []
+        engine = CodexAutoEngine(h.store, CodexAutoSettings(threshold=90, **kw), events.append)
+        return engine, events
+
+    def test_picks_the_seat_with_more_5h_room_despite_higher_weekly(self, h, tmp_path):
+        # Active 5h full. Peer A: 5h 0% but weekly 62%. Peer B: 5h 50% weekly 16%.
+        # max(5h,weekly) would wrongly prefer B (50<62); the 5h axis takes A.
+        engine, events = self._setup(
+            h, tmp_path,
+            active=_usage(100, 20, allowed=False),
+            ops=None,                                  # active (slot 2) set below
+            hello=_usage(0, 62),                       # slot 3: empty 5h, high weekly
+        )
+        # add a 4th seat with 5h 50% / weekly 16%
+        h.logins.append(("sam@example.com", "acct-team", "user-sam", "team"))
+        h.store.add_login()
+        h.readings["sam@example.com"] = _usage(50, 16)
+        assert engine.tick() == "switched"
+        assert h.store.resolve(h.store.active_number()).email == "hello@example.com"
+
+    def test_leaves_on_5h_not_on_a_high_weekly(self, h, tmp_path):
+        # Active 5h 40% (room) but weekly 95%. The old axis (binding 95) would
+        # bail; the 5h axis keeps draining the 5-hour window.
+        engine, events = self._setup(
+            h, tmp_path,
+            active=_usage(40, 95),
+            ops=_usage(40, 95),
+            hello=_usage(5, 10),
+        )
+        assert engine.tick() == "no-action"
+        assert events[-1]["reason"] == "below-threshold"
+        assert h.store.active_number() == "2"
+
+    def test_a_weekly_walled_seat_is_never_a_target(self, h, tmp_path):
+        # Active 5h full. Only peer has a fresh 5h (5%) but its weekly is 100%:
+        # no real room, so it is not chosen and the rotation blocks.
+        engine, events = self._setup(
+            h, tmp_path,
+            active=_usage(100, 30, allowed=False),
+            ops=_usage(100, 30, allowed=False),
+            hello=_usage(5, 100),
+        )
+        assert engine.tick() == "blocked"
+        assert h.store.active_number() == "2"
+
+    def test_binding_axis_still_available(self, h, tmp_path):
+        # With decide_on="binding", a high weekly does bail (old behavior).
+        engine, events = self._setup(
+            h, tmp_path,
+            active=_usage(40, 95),
+            ops=_usage(40, 95),
+            hello=_usage(5, 10),
+            decide_on="binding",
+        )
+        assert engine.tick() == "switched"
+        assert h.store.active_number() == "3"
