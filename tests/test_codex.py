@@ -289,7 +289,9 @@ class TestAuto:
         assert h.store.active_number() == "2"
 
     def test_nothing_with_room_blocks(self, h):
-        engine, events, _ = self._setup(h, _usage(None, 100, allowed=False), _usage(95, 10), _usage(None, 0, error="x"))
+        # Active hard out, one peer also refused, the other unreadable: the
+        # at-limit fallback has nowhere with room to land, so it blocks.
+        engine, events, _ = self._setup(h, _usage(None, 100, allowed=False), _usage(100, 10, allowed=False), _usage(None, 0, error="x"))
         assert engine.tick() == "blocked"
         assert h.store.active_number() == "1"
 
@@ -377,3 +379,55 @@ class TestRotatingHome:
         daybreak.mkdir()
         h.store.set_live_home(daybreak)
         assert h.store._read_index()["switchLog"] == []
+
+
+class TestAtLimitFallback:
+    """10-23: the active Daybreak seat hit 100% while the only peer sat at 98%
+    (over the 90% line but still allowed). The switcher must take it, not stall."""
+
+    def _setup(self, h, tmp_path, active_pct, peer):
+        h.write_live(PRO)
+        h.store.adopt_live()
+        db = tmp_path / "db"; db.mkdir()
+        (db / "auth.json").write_text(_auth(*SEAT_OPS, refresh="rt-db"))
+        h.store.set_live_home(db)          # ops (slot 2) rotates, Pro pinned
+        h.logins.append(SEAT_HELLO)
+        h.store.add_login()                # hello = slot 3
+        h.readings.update({
+            "kaya@example.com": _usage(None, 43),   # pinned Pro, ignored
+            "ops@example.com": active_pct,
+            "hello@example.com": peer,
+        })
+        events: list[dict] = []
+        engine = CodexAutoEngine(h.store, CodexAutoSettings(threshold=90), events.append)
+        return engine, events
+
+    def test_hard_out_takes_the_only_seat_with_room(self, h, tmp_path):
+        engine, events = self._setup(
+            h, tmp_path,
+            active_pct=_usage(100, 16, allowed=False),
+            peer=_usage(98, 62, allowed=True),
+        )
+        assert engine.tick() == "switched"
+        assert h.store.active_number() == "3"
+        assert next(e for e in events if e["event"] == "switch")["trigger"] == "at-limit"
+
+    def test_no_fallback_to_a_peer_also_refused(self, h, tmp_path):
+        engine, events = self._setup(
+            h, tmp_path,
+            active_pct=_usage(100, 16, allowed=False),
+            peer=_usage(100, 20, allowed=False),
+        )
+        assert engine.tick() == "blocked"
+        assert h.store.active_number() == "2"
+
+    def test_merely_over_threshold_still_waits_for_the_cooldown_line(self, h, tmp_path):
+        # Active at 92% (not hard out) with a 98% peer: no proactive move to a
+        # fuller seat, so it does not thrash over the line.
+        engine, events = self._setup(
+            h, tmp_path,
+            active_pct=_usage(92, 16, allowed=True),
+            peer=_usage(98, 62, allowed=True),
+        )
+        assert engine.tick() == "blocked"
+        assert h.store.active_number() == "2"

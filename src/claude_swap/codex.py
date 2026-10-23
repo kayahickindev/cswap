@@ -868,12 +868,20 @@ class CodexAutoEngine:
             self.store.refresh_usage([a.number for a in accounts if not a.active])
             self._last_full_read = now
             accounts = self.store.accounts()
-        candidates = [
+        usable = [
             a for a in accounts
             if not a.active and not a.pinned_to and a.usage is not None
             and a.usage.binding_pct is not None
-            and a.usage.binding_pct < self.settings.threshold
         ]
+        candidates = [a for a in usable if a.usage.binding_pct < self.settings.threshold]
+        if not candidates and exhausted:
+            # The active seat is hard out. Any peer with a sliver of room left
+            # (still under 100% and not refused by the backend) beats sitting
+            # on a dead seat, even though it is over the proactive line.
+            candidates = [
+                a for a in usable
+                if a.usage.binding_pct < 100.0 and a.usage.usage_allowed is not False
+            ]
         if not candidates:
             self._event("no-switch", reason="no-candidates",
                         detail="every other Codex login is at its limit or unread")
