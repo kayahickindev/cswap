@@ -61,6 +61,11 @@ class AutoSwitchSettings:
     # this utilization. ``threshold`` remains the near-100 drain ceiling once
     # no fresh model account remains.
     model_threshold: float = 90.0
+    # consume-first plans the rest of each weekly-only account's week at this
+    # many points per active hour. Once the weeks ending by some reset need
+    # all the time left before it, the week that ends first is spent before
+    # any Team seat's 5h window. 0 turns it off.
+    weekly_burn_pct_per_hour: float = 5.0
     # After a switch, prompt Herdr-hosted Claude Code sessions that stopped on
     # a usage limit to continue on the new login.
     resume_stalled: bool = True
@@ -145,6 +150,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "modelThreshold", "model_threshold", "float", 50.0, 99.9,
             help="Tiered-mode model rotation threshold in pct",
+        ),
+        SettingSpec(
+            "autoswitch", "weeklyBurnPctPerHour", "weekly_burn_pct_per_hour",
+            "float", 0.0, 100.0,
+            help="Planning burn for spending weekly-only accounts before their week resets (0 = off)",
         ),
         SettingSpec(
             "autoswitch", "resumeStalled", "resume_stalled", "bool",

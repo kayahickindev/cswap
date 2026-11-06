@@ -195,6 +195,16 @@ CONSUME_RESET_MARGIN_S = 3600.0
 # slower, so they are left to the threshold.
 CONSUME_FIVE_HOUR_MAX_PCT = 75.0
 
+# A weekly-only account's week is closing once the weeks ending by its reset
+# need all the time left less this margin: the hand-off cooldown, a reading
+# that lags, and quiet stretches all eat into the time left.
+CLOSING_WEEK_MARGIN_S = 2 * 3600.0
+
+# The account already spending a closing week keeps it while the weeks would
+# still need the time left at this multiple of the planned hours, so running
+# ahead of plan does not hand it back to a seat and then return an hour later.
+CLOSING_WEEK_HOLD_FACTOR = 2.0
+
 # Horizon past which a sooner reset stops being worth real headroom. The escape
 # above was measured on minutes-scale resets; days-scale is the opposite trade,
 # since neither account returns within the session. 4h keeps most of a 5-hour
@@ -876,6 +886,50 @@ def _has_five_hour_window(usage: dict | str | None) -> bool:
     return isinstance(window, dict) and isinstance(
         window.get("pct"), (int, float)
     )
+
+
+def _closing_week(
+    usage: dict[str, dict | str | None],
+    accounts: Sequence[str],
+    now: float,
+    ceiling: float,
+    rate_pct_per_hour: float,
+    factor: float = 1.0,
+) -> str | None:
+    """The weekly-only account to spend now so no week lapses unused.
+
+    Earliest deadline first over the accounts with a 7d window and no 5h
+    window: each needs ``(ceiling - 7d pct) / rate`` hours to spend. When the
+    weeks ending by some reset need at least the time left before it, less
+    CLOSING_WEEK_MARGIN_S, the week ending first is closing and is returned.
+    Until then the Team seats' 5h windows go first. ``factor`` scales the
+    hours needed (the hold band for the account already spending its week).
+    None when every week still fits, or when the rate is 0 (off).
+    """
+    if rate_pct_per_hour <= 0:
+        return None
+    weeks: list[tuple[float, str, float]] = []
+    for num in accounts:
+        value = usage.get(num)
+        if not isinstance(value, dict) or _has_five_hour_window(value):
+            continue
+        window = value.get("seven_day")
+        if not isinstance(window, dict) or not isinstance(
+            window.get("pct"), (int, float)
+        ):
+            continue
+        reset = _seven_day_reset_ts(value, now)
+        left = ceiling - float(window["pct"])
+        if reset is None or left <= 0:
+            continue
+        weeks.append((reset, num, left / rate_pct_per_hour * 3600.0 * factor))
+    weeks.sort()
+    needed = 0.0
+    for reset, _num, seconds in weeks:
+        needed += seconds
+        if needed + CLOSING_WEEK_MARGIN_S >= reset - now:
+            return weeks[0][1]
+    return None
 
 
 def _fresh_model_headroom(
@@ -2648,6 +2702,27 @@ class AutoSwitchEngine:
         active_has_five_hour = consume_first and _has_five_hour_window(
             usage.get(current)
         )
+        # A weekly-only account whose week can only just be spent in the time
+        # left goes ahead of the seats, and the one spending it holds it.
+        closing: str | None = None
+        active_closing = False
+        if consume_first:
+            fleet = [current, *oauth_candidates]
+            closing = _closing_week(
+                usage,
+                fleet,
+                now,
+                self.settings.threshold,
+                self.settings.weekly_burn_pct_per_hour,
+            )
+            active_closing = not active_has_five_hour and current == _closing_week(
+                usage,
+                fleet,
+                now,
+                self.settings.threshold,
+                self.settings.weekly_burn_pct_per_hour,
+                CLOSING_WEEK_HOLD_FACTOR,
+            )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -2778,14 +2853,19 @@ class AutoSwitchEngine:
                     # the threshold we must move, so any healthy account
                     # qualifies and the sort picks soonest).
                     #
-                    # An account with a 5h window (a Team seat) outranks a
-                    # weekly-only one: a weekly-only account hands off to a
-                    # seat whose 5h has room, and a seat never leaves for a
-                    # weekly-only account below the threshold. Between two of
-                    # a kind the reset rule stands.
+                    # A closing week comes first and is held until spent.
+                    # Otherwise an account with a 5h window (a Team seat)
+                    # outranks a weekly-only one: a weekly-only account hands
+                    # off to a seat whose 5h has room, and a seat never leaves
+                    # for a weekly-only account below the threshold. Between
+                    # two of a kind the reset rule stands.
                     if trigger == "consume-first":
                         has_five_hour = _has_five_hour_window(usage.get(num))
-                        if has_five_hour != active_has_five_hour:
+                        if num == closing:
+                            pass
+                        elif active_closing:
+                            continue
+                        elif has_five_hour != active_has_five_hour:
                             if not has_five_hour or not _five_hour_has_room(
                                 usage.get(num)
                             ):
@@ -2829,14 +2909,18 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif consume_first:
-                # Among accounts whose 5h window has room: accounts with a
-                # 5h window (Team seats) first, then soonest weekly reset
-                # (unknown resets sort last), most headroom breaks ties, then
-                # sequence order. When no 5h window has room, the most
-                # headroom wins: landing on the fullest one only moves the
-                # next hand-off into the cooldown.
+                # Among accounts whose 5h window has room: a closing week
+                # first, then accounts with a 5h window (Team seats), then
+                # soonest weekly reset (unknown resets sort last), most
+                # headroom breaks ties, then sequence order. When no 5h
+                # window has room, the most headroom wins: landing on the
+                # fullest one only moves the next hand-off into the cooldown.
                 reset_key = reset_ts if reset_ts is not None else float("inf")
-                seat_rank = 0 if _has_five_hour_window(usage.get(num)) else 1
+                seat_rank = (
+                    0
+                    if num == closing
+                    else 1 if _has_five_hour_window(usage.get(num)) else 2
+                )
                 key = (
                     (0, seat_rank, reset_key, -h)
                     if _five_hour_has_room(usage.get(num))

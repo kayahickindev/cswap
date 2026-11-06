@@ -4088,10 +4088,11 @@ class TestFiveHourSeatsFirst:
 
     def test_a_max_account_hands_back_to_a_seat_with_5h_room(self, temp_home):
         """appointra's week ends sooner than ops's and it is well below the
-        threshold, but ops has a 5h window with room."""
+        threshold, but ops has a 5h window with room and appointra's week
+        is not closing."""
         h = self._fleet(temp_home, 1, strategy="consume-first")
         outcome = h.tick_with_usage({
-            "1": _max_now(30, 5, 20),
+            "1": _max_now(30, 5, 60),
             "5": _seat_now(40, 10, 23, 82),
         })
         assert outcome is TickOutcome.SWITCHED
@@ -4203,9 +4204,9 @@ class TestFiveHourSeatsFirst:
             model_threshold=80.0,
         )
         outcome = h.tick_with_usage({
-            "1": _max_now(30, 100, 20),
-            "3": _max_now(10, 100, 15),
-            "4": _max_now(40, 100, 30),
+            "1": _max_now(30, 100, 120),
+            "3": _max_now(10, 100, 115),
+            "4": _max_now(40, 100, 130),
             "5": _seat_now(10, 10, 100, 82),
             "6": _seat_now(80, 95, 100, 25),
             "7": _seat_now(96, 30, 100, 40),
@@ -4214,6 +4215,127 @@ class TestFiveHourSeatsFirst:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 5
+
+
+class TestClosingWeeksBurnBeforeReset:
+    """Kaya's rule (2026-11-06): a Max week is spent before it resets. Seats
+    keep going first until the weeks ending by some reset need all the time
+    left before it at the planning rate (5 points per active hour), then the
+    week ending first takes over and holds until it is spent."""
+
+    _EMAILS = {**TestFiveHourSeatsFirst._EMAILS, 2: "mfs"}
+    _fleet = TestSoonestWeeklyResetFirst._fleet
+
+    def _tiered(self, temp_home: Path, active: int) -> EngineHarness:
+        return self._fleet(
+            temp_home, active, strategy="tiered", threshold=95.0,
+            model_threshold=80.0,
+        )
+
+    @staticmethod
+    def _live(**overrides) -> dict:
+        usage = dict(TestFiveHourSeatsFirst._LIVE_11_06)
+        usage.update(overrides)
+        return usage
+
+    def test_seats_go_first_while_every_week_still_fits(self, temp_home):
+        """11:41 AM ET 11-06 plus mfs (85 pts left, 33h out): appointra and
+        mfs need 36h of the 44h before appointra's reset; seats first."""
+        h = self._tiered(temp_home, 4)
+        outcome = h.tick_with_usage(self._live(
+            **{"1": _max_now(2, 2, 44), "2": _max_now(10, 0, 33)}
+        ))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 7
+
+    def test_a_seat_leaves_for_the_week_that_must_start_now(self, temp_home):
+        """Seven hours later the same two weeks need all the time left
+        before appointra's reset: mfs, ending first, takes over."""
+        h = self._tiered(temp_home, 7)
+        outcome = h.tick_with_usage(self._live(
+            **{
+                "1": _max_now(2, 2, 37),
+                "2": _max_now(10, 0, 26),
+                "7": _seat_now(20, 12, 5, 114),
+            }
+        ))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_the_closing_week_holds_while_it_runs_ahead_of_plan(
+        self, temp_home
+    ):
+        """mfs has burned faster than planned and no longer needs all the
+        time left, but it still needs more than half: it keeps going."""
+        h = self._tiered(temp_home, 2)
+        outcome = h.tick_with_usage(self._live(
+            **{"1": _max_now(2, 2, 34), "2": _max_now(60, 5, 23)}
+        ))
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_a_week_with_time_to_spare_hands_back_to_a_seat(self, temp_home):
+        h = self._tiered(temp_home, 2)
+        outcome = h.tick_with_usage(self._live(
+            **{"1": _max_now(2, 2, 140), "2": _max_now(60, 5, 100)}
+        ))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 7
+
+    def test_a_seat_at_its_threshold_hands_off_to_the_closing_week(
+        self, temp_home
+    ):
+        h = self._tiered(temp_home, 7)
+        outcome = h.tick_with_usage(self._live(
+            **{
+                "2": _max_now(10, 0, 18),
+                "7": _seat_now(97, 20, 5, 114),
+            }
+        ))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_zero_turns_it_off(self, temp_home):
+        h = self._fleet(
+            temp_home, 7, strategy="tiered", threshold=95.0,
+            model_threshold=80.0, weekly_burn_pct_per_hour=0.0,
+        )
+        outcome = h.tick_with_usage(self._live(
+            **{
+                "1": _max_now(2, 2, 37),
+                "2": _max_now(10, 0, 26),
+                "7": _seat_now(20, 12, 5, 114),
+            }
+        ))
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 7
+
+
+class TestClosingWeekPlanner:
+    """`_closing_week` on its own: earliest deadline first."""
+
+    def test_stacked_weeks_start_the_first_one_early(self):
+        from claude_swap.autoswitch import _closing_week
+
+        now = FakeClock().now
+        usage = {"1": _max_now(5, 0, 30), "2": _max_now(5, 0, 37)}
+        # 18h each at 5/h: 36h + 2h margin >= 37h before #2's reset, so #1
+        # (ending first) starts now though it alone fits in its 30h.
+        assert _closing_week(usage, ["1", "2"], now, 95.0, 5.0) == "1"
+        usage = {"1": _max_now(5, 0, 30), "2": _max_now(5, 0, 39)}
+        assert _closing_week(usage, ["1", "2"], now, 95.0, 5.0) is None
+
+    def test_seats_and_spent_weeks_are_not_planned(self):
+        from claude_swap.autoswitch import _closing_week
+
+        now = FakeClock().now
+        usage = {
+            "1": _max_now(95, 0, 1),
+            "5": _seat_now(0, 0, 0, 1),
+        }
+        assert _closing_week(usage, ["1", "5"], now, 95.0, 5.0) is None
 
 
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
