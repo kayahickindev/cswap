@@ -859,16 +859,18 @@ def _five_hour_has_room(usage: dict | str | None) -> bool:
     return True
 
 
-def _no_weekly_limit(usage: dict | str | None) -> bool:
-    """Whether the account reports a 5h window and no account-wide weekly one.
+def _has_five_hour_window(usage: dict | str | None) -> bool:
+    """Whether the account reports a 5h window.
 
-    Team premium seats on the Claude for Startups plan read this way (10-19:
-    ``seven_day`` null, ``limits`` holds only the session row and the Fable
-    row). Their 5h quota costs nothing against a week, so consume-first spends
-    it before any weekly account's. Read from the response rather than the
-    plan name, so the preference ends by itself if a weekly row ever appears.
+    Since 2026-11 the Max accounts report only a 7d row and the Fable row,
+    while the Team premium seats report 5h, 7d and Fable. A 5h window is
+    quota that lapses every five hours whether it was used or not, while a
+    weekly-only account keeps its quota until the week ends, so consume-first
+    spends every seat's 5h window before a weekly-only account's. Read from
+    the response rather than the plan name: if every account reports a 5h
+    window, or none does, the order falls back to weekly resets alone.
     """
-    if not isinstance(usage, dict) or isinstance(usage.get("seven_day"), dict):
+    if not isinstance(usage, dict):
         return False
     window = usage.get("five_hour")
     return isinstance(window, dict) and isinstance(
@@ -1109,24 +1111,37 @@ class AutoSwitchEngine:
         )
         if has_fresh:
             # Normal model rotation. Account-wide quota retains its separate
-            # near-100 ceiling instead of becoming a second 90% model gate.
+            # near-100 ceiling instead of becoming a second 90% model gate,
+            # less the burn margin: a Team seat burns its 5h window fast
+            # enough to cross a fixed ceiling between two reads.
             self._tier_mode = "fresh-model"
             self._decision_models = self._models
+            general_threshold = self._adaptive_drain_threshold(
+                current,
+                entries.get(current),
+                usage.get(current),
+                (),
+                settings.threshold,
+                min_margin=0,
+            )
             headroom = {
                 number: _fresh_model_headroom(
                     value,
                     self._models,
                     settings.model_threshold,
-                    settings.threshold,
+                    general_threshold,
                 )
                 for number, value in usage.items()
             }
             return (
                 replace(
                     settings,
-                    # Hold the current model allocation until it reaches the
-                    # model threshold, then rank fresh targets by reset time.
-                    strategy="tiered",
+                    # Rotate model quota at the model threshold, ranked by
+                    # consume-first on the model's weekly reset: a weekly-only
+                    # account hands off to a seat whose 5h window has room
+                    # even while its model quota is fresh, and a seat never
+                    # leaves for a weekly-only account below the line.
+                    strategy="consume-first",
                     threshold=settings.model_threshold,
                 ),
                 headroom,
@@ -2630,7 +2645,9 @@ class AutoSwitchEngine:
             if consume_first
             else None
         )
-        active_no_weekly = consume_first and _no_weekly_limit(usage.get(current))
+        active_has_five_hour = consume_first and _has_five_hour_window(
+            usage.get(current)
+        )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -2761,14 +2778,15 @@ class AutoSwitchEngine:
                     # the threshold we must move, so any healthy account
                     # qualifies and the sort picks soonest).
                     #
-                    # An account with no weekly limit outranks every weekly
-                    # one: leave a weekly account for it whenever its 5h has
-                    # room, and never leave it for weekly quota below the
-                    # threshold. Between two of a kind the reset rule stands.
+                    # An account with a 5h window (a Team seat) outranks a
+                    # weekly-only one: a weekly-only account hands off to a
+                    # seat whose 5h has room, and a seat never leaves for a
+                    # weekly-only account below the threshold. Between two of
+                    # a kind the reset rule stands.
                     if trigger == "consume-first":
-                        no_weekly = _no_weekly_limit(usage.get(num))
-                        if no_weekly != active_no_weekly:
-                            if not no_weekly or not _five_hour_has_room(
+                        has_five_hour = _has_five_hour_window(usage.get(num))
+                        if has_five_hour != active_has_five_hour:
+                            if not has_five_hour or not _five_hour_has_room(
                                 usage.get(num)
                             ):
                                 continue
@@ -2811,15 +2829,16 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif consume_first:
-                # Among accounts whose 5h window has room: no weekly limit
-                # first, then soonest weekly reset (unknown resets sort last),
-                # most headroom breaks ties, then sequence order. When no 5h
-                # window has room, the most headroom wins: landing on the
-                # fullest one only moves the next hand-off into the cooldown.
+                # Among accounts whose 5h window has room: accounts with a
+                # 5h window (Team seats) first, then soonest weekly reset
+                # (unknown resets sort last), most headroom breaks ties, then
+                # sequence order. When no 5h window has room, the most
+                # headroom wins: landing on the fullest one only moves the
+                # next hand-off into the cooldown.
                 reset_key = reset_ts if reset_ts is not None else float("inf")
-                weekly_rank = 0 if _no_weekly_limit(usage.get(num)) else 1
+                seat_rank = 0 if _has_five_hour_window(usage.get(num)) else 1
                 key = (
-                    (0, weekly_rank, reset_key, -h)
+                    (0, seat_rank, reset_key, -h)
                     if _five_hour_has_room(usage.get(num))
                     else (1, -h, reset_key)
                 )

@@ -3084,7 +3084,7 @@ class TestTieredModelStrategy:
 
         assert "manualOverride" not in h.state()
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["below-threshold"]
+        assert reasons == ["already-consuming-soonest"]
 
     def test_new_manual_override_wins_if_it_lands_before_auto_commit(
         self, temp_home
@@ -3206,15 +3206,35 @@ class TestTieredModelStrategy:
         assert "manualOverride" not in h.state()
         assert h.state()["lastSeenActive"] == "2"
 
-    def test_fresh_model_mode_holds_until_the_model_threshold(self, temp_home):
+    def test_fresh_model_mode_holds_while_no_model_week_ends_sooner(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _tier_usage(10, 20, 89, _R_LATEST, _R_SOON),
+            "2": _tier_usage(10, 20, 20, _R_LATEST, _R_LATER),
+            "3": _tier_usage(10, 20, 10, _R_LATEST, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_fresh_model_mode_moves_to_the_model_week_ending_first(
+        self, temp_home
+    ):
+        """Below the model threshold, fresh-model mode is consume-first on the
+        model's own week (2026-11-06): spend the Fable week that ends first."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _tier_usage(10, 20, 89, _R_LATEST, _R_LATEST),
             "2": _tier_usage(10, 20, 20, _R_LATEST, _R_SOON),
             "3": _tier_usage(10, 20, 10, _R_LATEST, _R_LATER),
         })
-        assert outcome is TickOutcome.NO_ACTION
-        assert h.active_number() == 1
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
 
     def test_last_model_account_drains_past_model_threshold(self, temp_home):
         h = self._harness(temp_home)
@@ -4021,58 +4041,105 @@ class TestSoonestWeeklyResetFirst:
         assert h.active_number() == 2
 
 
-class TestNoWeeklyLimitFirst:
-    """Kaya's rule (10-19, evening): Team seats on the Startups plan report no
-    weekly limit, so their 5h windows are spent before any Max account's."""
+def _seat_now(pct5: float, pct7: float, fable: float, week_h: float) -> dict:
+    """Team seat since 2026-11: 5h, 7d and Fable rows (shared weekly reset)."""
+    now = FakeClock().now
+    week = _iso_at(now + week_h * _H)
+    return {
+        "five_hour": {"pct": pct5, "resets_at": _iso_at(now + 2 * _H)},
+        "seven_day": {"pct": pct7, "resets_at": week},
+        "scoped": [{"name": "Fable", "pct": fable, "resets_at": week}],
+    }
 
+
+def _max_now(pct7: float, fable: float, week_h: float) -> dict:
+    """Max account since 2026-11: 7d and Fable rows, no 5h window."""
+    now = FakeClock().now
+    week = _iso_at(now + week_h * _H)
+    return {
+        "seven_day": {"pct": pct7, "resets_at": week},
+        "scoped": [{"name": "Fable", "pct": fable, "resets_at": week}],
+    }
+
+
+class TestFiveHourSeatsFirst:
+    """Kaya's rule (2026-11-06): Max accounts no longer have a 5h window and
+    can be run through any time; the Team seats' 5h windows lapse every five
+    hours, so every seat's 5h window is spent before a Max account's week."""
+
+    _EMAILS = {
+        1: "appointra", 3: "gmail", 4: "successai", 5: "ops",
+        6: "partnerships", 7: "hello", 8: "support", 9: "kaya-team",
+    }
     _fleet = TestSoonestWeeklyResetFirst._fleet
-    _EMAILS = TestSoonestWeeklyResetFirst._EMAILS
+
+    # `cswap list` at 11:41 AM ET 11-06: the daemon was flipping between
+    # successai and partnerships (7d at 95%) while four seats sat at 5h 0%.
+    _LIVE_11_06 = {
+        "1": _max_now(1, 2, 45),
+        "3": _max_now(3, 0, 136),
+        "4": _max_now(39, 13, 99),
+        "5": _seat_now(0, 0, 0, 160),
+        "6": _seat_now(74, 95, 35, 98),
+        "7": _seat_now(0, 10, 0, 121),
+        "8": _seat_now(0, 0, 0, 127),
+        "9": _seat_now(2, 2, 0, 138),
+    }
 
     def test_a_max_account_hands_back_to_a_seat_with_5h_room(self, temp_home):
-        """appointra's week ends sooner than ops's Fable week, and it is well
-        below the threshold, but ops has 5h room and no weekly limit."""
+        """appointra's week ends sooner than ops's and it is well below the
+        threshold, but ops has a 5h window with room."""
         h = self._fleet(temp_home, 1, strategy="consume-first")
         outcome = h.tick_with_usage({
-            "1": _personal(10, 30, 5, 20),
-            "5": _seat(40, 23, 82),
+            "1": _max_now(30, 5, 20),
+            "5": _seat_now(40, 10, 23, 82),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 5
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
 
-    def test_a_seat_never_leaves_for_a_sooner_week_below_the_threshold(
+    def test_a_seat_never_leaves_for_a_sooner_max_week_below_the_threshold(
         self, temp_home
     ):
         h = self._fleet(temp_home, 7, strategy="consume-first")
         outcome = h.tick_with_usage({
-            "3": _personal(0, 60, 20, 10),
-            "7": _seat(50, 33, 44),
+            "3": _max_now(60, 20, 10),
+            "7": _seat_now(50, 20, 33, 44),
         })
         assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 7
+
+    def test_between_seats_the_sooner_week_still_wins(self, temp_home):
+        h = self._fleet(temp_home, 9, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "7": _seat_now(10, 10, 5, 44),
+            "9": _seat_now(20, 12, 8, 81),
+        })
+        assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 7
 
     def test_a_max_account_keeps_working_while_every_seat_is_nearly_full(
         self, temp_home
     ):
-        h = self._fleet(temp_home, 2, strategy="consume-first")
+        h = self._fleet(temp_home, 3, strategy="consume-first")
         outcome = h.tick_with_usage({
-            "2": _personal(10, 59, 16, 100),
-            "5": _seat(78, 23, 82),
-            "6": _seat(98, 43, 21),
+            "3": _max_now(59, 16, 100),
+            "5": _seat_now(78, 23, 20, 82),
+            "6": _seat_now(98, 43, 30, 21),
         })
         assert outcome is TickOutcome.NO_ACTION
-        assert h.active_number() == 2
+        assert h.active_number() == 3
 
     def test_a_hand_off_takes_a_seat_over_a_sooner_max_week(self, temp_home):
-        """hello hits its wall: support (5h room, Fable week 2 days out) beats
+        """hello hits its 5h wall: support (5h room, week 2 days out) beats
         gmail (week ending in 10h) and appointra (most headroom)."""
         h = self._fleet(temp_home, 7, strategy="consume-first")
         outcome = h.tick_with_usage({
-            "1": _personal(0, 5, 1, 150),
-            "3": _personal(0, 60, 20, 10),
-            "7": _seat(100, 33, 44),
-            "8": _seat(30, 24, 50),
+            "1": _max_now(5, 1, 150),
+            "3": _max_now(60, 20, 10),
+            "7": _seat_now(100, 33, 30, 44),
+            "8": _seat_now(30, 24, 20, 50),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 8
@@ -4082,29 +4149,71 @@ class TestNoWeeklyLimitFirst:
     ):
         h = self._fleet(temp_home, 7, strategy="consume-first")
         outcome = h.tick_with_usage({
-            "1": _personal(0, 5, 1, 150),
-            "3": _personal(0, 60, 20, 10),
-            "7": _seat(100, 33, 44),
-            "8": _seat(97, 24, 50),
+            "1": _max_now(5, 1, 150),
+            "3": _max_now(60, 20, 10),
+            "7": _seat_now(100, 33, 30, 44),
+            "8": _seat_now(97, 24, 20, 50),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_a_seat_that_gains_a_weekly_row_loses_its_priority(
+    def test_the_live_fleet_moves_to_the_seat_whose_week_ends_first(
         self, temp_home
     ):
-        h = self._fleet(temp_home, 1, strategy="consume-first")
-        seat_with_week = _seat(40, 23, 82)
-        seat_with_week["seven_day"] = {
-            "pct": 10,
-            "resets_at": seat_with_week["scoped"][0]["resets_at"],
-        }
-        outcome = h.tick_with_usage({
-            "1": _personal(10, 30, 5, 20),
-            "5": seat_with_week,
-        })
+        """The 11-06 settings (tiered, Fable, 95/80): successai hands off to
+        hello, the seat with 5h room whose week ends first. partnerships ends
+        sooner but its 7d is at 95%."""
+        h = self._fleet(
+            temp_home, 4, strategy="tiered", threshold=95.0,
+            model_threshold=80.0,
+        )
+        outcome = h.tick_with_usage(self._LIVE_11_06)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 7
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_a_seat_keeps_working_while_fable_is_fresh_on_max(self, temp_home):
+        h = self._fleet(
+            temp_home, 7, strategy="tiered", threshold=95.0,
+            model_threshold=80.0,
+        )
+        live = dict(self._LIVE_11_06)
+        live["7"] = _seat_now(60, 25, 30, 121)
+        outcome = h.tick_with_usage(live)
         assert outcome is TickOutcome.NO_ACTION
-        assert h.active_number() == 1
+        assert h.active_number() == 7
+
+    def test_fable_at_the_model_threshold_leaves_for_fresh_fable_on_a_seat(
+        self, temp_home
+    ):
+        h = self._fleet(
+            temp_home, 7, strategy="tiered", threshold=95.0,
+            model_threshold=80.0,
+        )
+        live = dict(self._LIVE_11_06)
+        live["7"] = _seat_now(30, 40, 80, 121)
+        outcome = h.tick_with_usage(live)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 8
+
+    def test_with_fable_spent_everywhere_seats_still_go_first(self, temp_home):
+        h = self._fleet(
+            temp_home, 1, strategy="tiered", threshold=95.0,
+            model_threshold=80.0,
+        )
+        outcome = h.tick_with_usage({
+            "1": _max_now(30, 100, 20),
+            "3": _max_now(10, 100, 15),
+            "4": _max_now(40, 100, 30),
+            "5": _seat_now(10, 10, 100, 82),
+            "6": _seat_now(80, 95, 100, 25),
+            "7": _seat_now(96, 30, 100, 40),
+            "8": _seat_now(20, 20, 100, 90),
+            "9": _seat_now(90, 20, 100, 60),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5
 
 
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
