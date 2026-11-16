@@ -14,6 +14,7 @@ import pytest
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
+    _weekly_rescaled,
     MANUAL_UNMEASURED_GRACE_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
@@ -612,6 +613,83 @@ class TestDecisionTable:
         assert event.earliest_reset_at is None
         assert harness.engine._sleep_until_ts is None
         assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+
+
+class TestWeeklyThreshold:
+    """``weekly_threshold`` moves the 7d switch line without touching 5h."""
+
+    def test_rescale_maps_weekly_line_onto_threshold(self):
+        value = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 99.0}}
+        out = _weekly_rescaled(value, 95.0, 99.0)
+        assert out["seven_day"]["pct"] == pytest.approx(95.0)
+        assert out["five_hour"]["pct"] == 40.0
+        assert value["seven_day"]["pct"] == 99.0  # input untouched
+        assert _weekly_rescaled(
+            {"seven_day": {"pct": 100.0}}, 95.0, 99.0
+        )["seven_day"]["pct"] == pytest.approx(100.0)
+        assert _weekly_rescaled(
+            {"seven_day": {"pct": 99.5}}, 95.0, 99.0
+        )["seven_day"]["pct"] == pytest.approx(97.5)
+        assert _weekly_rescaled(
+            {"seven_day": {"pct": 49.5}}, 95.0, 99.0
+        )["seven_day"]["pct"] == pytest.approx(47.5)
+
+    def test_rescale_off_when_not_above_threshold(self):
+        value = {"seven_day": {"pct": 97.0}}
+        assert _weekly_rescaled(value, 95.0, 0.0) is value
+        assert _weekly_rescaled(value, 95.0, 95.0) is value
+        assert _weekly_rescaled(value, 95.0, 90.0) is value
+        assert _weekly_rescaled("token-expired", 95.0, 99.0) == "token-expired"
+        assert _weekly_rescaled({"five_hour": {"pct": 1.0}}, 95.0, 99.0) == {
+            "five_hour": {"pct": 1.0}
+        }
+
+    def _two_accounts(self, temp_home, **kwargs):
+        h = EngineHarness(
+            temp_home, threshold=95.0, cooldown_seconds=0.0, **kwargs
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_weekly_at_96_holds_with_weekly_line_99(self, temp_home):
+        h = self._two_accounts(temp_home, weekly_threshold=99.0)
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 96.0}},
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 5.0}},
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.windows["1"]["7d"] == 96.0  # log keeps the raw reading
+
+    def test_weekly_at_96_switches_without_weekly_line(self, temp_home):
+        h = self._two_accounts(temp_home)
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 96.0}},
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 5.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_weekly_at_99_switches_with_weekly_line_99(self, temp_home):
+        h = self._two_accounts(temp_home, weekly_threshold=99.0)
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 99.0}},
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 5.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_five_hour_line_unchanged_by_weekly_line(self, temp_home):
+        h = self._two_accounts(temp_home, weekly_threshold=99.0)
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 10.0}},
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 5.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
 
 
 class TestIdleHold:
@@ -4215,6 +4293,45 @@ class TestFiveHourSeatsFirst:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 5
+
+
+    def test_weekly_line_99_keeps_a_max_week_working_past_95(self, temp_home):
+        """The 11-16 fleet (tiered, Fable, 95/80, weekly line 99): gmail at
+        96% of its week stays put instead of parking 4 points unused."""
+        fleet = {
+            "1": _max_now(0, 0, 140),
+            "2": _max_now(21, 38, 129),
+            "3": _max_now(96, 33, 63),
+            "7": _seat_now(96, 28, 9, 48),
+            "9": _seat_now(96, 23, 4, 100),
+        }
+        settings = dict(
+            strategy="tiered", threshold=95.0, model_threshold=80.0,
+            weekly_burn_pct_per_hour=2.5, cooldown_seconds=0.0,
+        )
+        h = self._fleet(temp_home, 3, weekly_threshold=99.0, **settings)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+
+        fleet["3"] = _max_now(99, 33, 63)
+        h.clock.advance(60)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        assert h.active_number() != 3
+
+    def test_without_weekly_line_a_max_week_leaves_at_95(self, temp_home):
+        h = self._fleet(
+            temp_home, 3, strategy="tiered", threshold=95.0,
+            model_threshold=80.0, weekly_burn_pct_per_hour=2.5,
+        )
+        outcome = h.tick_with_usage({
+            "1": _max_now(0, 0, 140),
+            "2": _max_now(21, 38, 129),
+            "3": _max_now(96, 33, 63),
+            "7": _seat_now(96, 28, 9, 48),
+            "9": _seat_now(96, 23, 4, 100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() != 3
 
 
 class TestClosingWeeksBurnBeforeReset:

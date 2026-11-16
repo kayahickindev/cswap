@@ -66,6 +66,13 @@ class AutoSwitchSettings:
     # all the time left before it, the week that ends first is spent before
     # any Team seat's 5h window. 0 turns it off.
     weekly_burn_pct_per_hour: float = 5.0
+    # Separate switch line for the account-wide 7d window. The weekly window
+    # burns several times slower than the 5h one, so it can run closer to
+    # 100 before a switch without a session hitting the limit mid-swap. The
+    # engine rescales each 7d reading so this value lands on ``threshold``,
+    # which keeps every comparison on one scale. 0, or anything at or below
+    # ``threshold``, leaves the 7d window on ``threshold``.
+    weekly_threshold: float = 0.0
     # After a switch, prompt Herdr-hosted Claude Code sessions that stopped on
     # a usage limit to continue on the new login.
     resume_stalled: bool = True
@@ -155,6 +162,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "weeklyBurnPctPerHour", "weekly_burn_pct_per_hour",
             "float", 0.0, 100.0,
             help="Planning burn for spending weekly-only accounts before their week resets (0 = off)",
+        ),
+        SettingSpec(
+            "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 0.0, 99.9,
+            help="Switch line for the 7d window in pct (0 = same as threshold)",
         ),
         SettingSpec(
             "autoswitch", "resumeStalled", "resume_stalled", "bool",

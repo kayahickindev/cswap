@@ -869,6 +869,41 @@ def _five_hour_has_room(usage: dict | str | None) -> bool:
     return True
 
 
+def _weekly_rescaled(
+    value: dict | str | None, threshold: float, weekly_threshold: float
+) -> dict | str | None:
+    """``value`` with its 7d pct moved onto the ``threshold`` scale.
+
+    Piecewise linear: ``weekly_threshold`` maps to ``threshold`` and 100 stays
+    100, so a 7d window at its hard limit still reads as exhausted while a
+    week at 98 sits under a 95 switch line when ``weekly_threshold`` is 99.
+    Every decision reads the rescaled value, so headroom, ranking, the drain
+    margin and the tiered model scaling all keep comparing on one scale.
+    Returns ``value`` unchanged when the weekly line is off or not above
+    ``threshold``, or when there is no numeric 7d row.
+    """
+    if (
+        not isinstance(value, dict)
+        or weekly_threshold <= threshold
+        or weekly_threshold >= 100.0
+    ):
+        return value
+    window = value.get("seven_day")
+    if not isinstance(window, dict):
+        return value
+    pct = window.get("pct")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return value
+    pct = float(pct)
+    if pct <= weekly_threshold:
+        scaled = pct * threshold / weekly_threshold
+    else:
+        scaled = threshold + (pct - weekly_threshold) * (100.0 - threshold) / (
+            100.0 - weekly_threshold
+        )
+    return {**value, "seven_day": {**window, "pct": scaled}}
+
+
 def _has_five_hour_window(usage: dict | str | None) -> bool:
     """Whether the account reports a 5h window.
 
@@ -1795,10 +1830,13 @@ class AutoSwitchEngine:
                     for num, entry in entries.items()
                     if usage.get(num) is None and entry.last_error
                 },
+                # Raw readings, not the weekly-rescaled decision values, so
+                # the log shows the percentages the account really reports.
                 windows={
                     num: pcts
-                    for num, value in usage.items()
-                    if (pcts := _window_pcts(
+                    for num, entry in entries.items()
+                    if (value := entry.decision_value()) is not None
+                    and (pcts := _window_pcts(
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
@@ -2090,7 +2128,7 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._decision_usage(entries)
             if self.settings.strategy == "tiered" and self._models:
                 settings, headroom = self._tiered_policy(
                     current, quarantined, entries, usage, self.settings
@@ -2708,19 +2746,24 @@ class AutoSwitchEngine:
         active_closing = False
         if consume_first:
             fleet = [current, *oauth_candidates]
+            # The 7d readings are on the rescaled decision scale, so the
+            # planning burn moves onto it too and the hours needed stay real.
+            weekly_rate = self.settings.weekly_burn_pct_per_hour
+            if self.settings.threshold < self.settings.weekly_threshold < 100.0:
+                weekly_rate *= self.settings.threshold / self.settings.weekly_threshold
             closing = _closing_week(
                 usage,
                 fleet,
                 now,
                 self.settings.threshold,
-                self.settings.weekly_burn_pct_per_hour,
+                weekly_rate,
             )
             active_closing = not active_has_five_hour and current == _closing_week(
                 usage,
                 fleet,
                 now,
                 self.settings.threshold,
-                self.settings.weekly_burn_pct_per_hour,
+                weekly_rate,
                 CLOSING_WEEK_HOLD_FACTOR,
             )
         # When NOTHING is below the threshold — the active account and every
@@ -2946,6 +2989,17 @@ class AutoSwitchEngine:
 
     # -- adaptive usage scheduling ---------------------------------------------
 
+    def _decision_usage(self, entries: dict) -> dict[str, dict | str | None]:
+        """Decision values per account, 7d rescaled by ``weekly_threshold``."""
+        return {
+            num: _weekly_rescaled(
+                entry.decision_value(),
+                self.settings.threshold,
+                self.settings.weekly_threshold,
+            )
+            for num, entry in entries.items()
+        }
+
     def _collect_scheduled_usage(
         self,
         current: str,
@@ -3043,7 +3097,7 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        usage = self._decision_usage(entries)
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -3085,7 +3139,7 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._decision_usage(entries)
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
